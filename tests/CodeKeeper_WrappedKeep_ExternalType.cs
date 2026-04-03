@@ -6,7 +6,6 @@ public static partial class Tests
 {
     public static void Run()
     {
-        CodeKeeper.Instance = new CodeKeeperBase();
         const string typeName = "System.Runtime.CompilerServices.StrongBox`1[[System.Int32, System.Private.CoreLib]], System.Private.CoreLib";
         WrappedKeep<StrongBox<int>>();
 

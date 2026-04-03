@@ -328,6 +328,44 @@ NativeAOT tests are tricky because ILC performs whole-program analysis. Any type
 | `TestInterfaceMembers(instance, interfaceType, names...)` | Batch version of `TestInterfaceMember` |
 | `Test(label, action)` | Run an action, print OK/FAIL with exception details |
 
+## NativeAOT MSBuild Properties
+
+Key MSBuild properties that control code generation, trimming, and metadata retention:
+
+### Metadata and reflection
+
+| Property | Default | Description |
+|---|---|---|
+| `PublishAot` | `false` | Enable NativeAOT compilation |
+| `IlcTrimMetadata` | `true` | Strip reflection metadata from members without explicit retention hints. When `true`, code generation and metadata are independent — having native code does NOT preserve metadata. When `false`, metadata is preserved for all members that have code. |
+| `IlcGenerateCompleteTypeMetadata` | `true` | Generate complete type metadata for types that have code |
+| `IlcDisableReflection` | `false` | Disable reflection entirely for maximum trimming |
+| `JsonSerializerIsReflectionEnabledByDefault` | `false` | Allow System.Text.Json reflection-based serialization |
+
+### Code generation and optimization
+
+| Property | Default | Description |
+|---|---|---|
+| `IlcOptimizationPreference` | `Speed` | `Speed`, `Size`, or blank |
+| `IlcFoldIdenticalMethodBodies` | `false` | Fold identical method bodies to reduce binary size |
+| `IlcInstructionSet` | native | CPU instruction sets (e.g., `avx2,bmi2,lzcnt`) |
+
+### Diagnostics
+
+| Property | Default | Description |
+|---|---|---|
+| `IlcGenerateDgmlFile` | `false` | Generate dependency graph files for analyzing why types/methods were kept or trimmed |
+| `IlcGenerateStackTraceData` | `true` | Include method names in stack traces |
+| `SuppressTrimAnalysisWarnings` | `false` | Suppress IL20xx/IL30xx trimming warnings |
+
+### Runtime behavior
+
+| Property | Default | Description |
+|---|---|---|
+| `InvariantGlobalization` | `false` | Remove globalization data for smaller binary |
+| `UseSystemResourceKeys` | `false` | Strip exception message strings |
+| `EventSourceSupport` | `true` | EventSource/ETW support |
+
 ## Dependency Graph Analysis
 
 `IlcGenerateDgmlFile` is enabled in the project. After publishing, ILC generates two DGML files in `obj/Release/net10.0/win-x64/native/`:

@@ -4,7 +4,6 @@ public static partial class Tests
 {
     public static void Run()
     {
-        CodeKeeper.Instance = new CodeKeeperBase();
         CodeKeeper.Keep("NativeAotQuirks.RareStruct`1[[NativeAotQuirks.StructA, NativeAotQuirks]], NativeAotQuirks");
 
         Console.WriteLine("=== StructGeneric_KeepOneStruct_DoesNotCoverOtherStructs ===");

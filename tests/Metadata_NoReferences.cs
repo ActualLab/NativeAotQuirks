@@ -4,7 +4,6 @@ public static partial class Tests
 {
     public static void Run()
     {
-        CodeKeeper.Instance = new CodeKeeperBase();
         const string typeName = "NativeAotQuirks.UnreferencedType, NativeAotQuirks";
 
         Console.WriteLine("=== Metadata_NoReferences ===");

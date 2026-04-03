@@ -4,7 +4,6 @@ public static partial class Tests
 {
     public static void Run()
     {
-        CodeKeeper.Instance = new CodeKeeperBase();
         Console.WriteLine("=== Interface_NoKeep_InterfaceMembersStillWork ===");
         Console.WriteLine("Kept: nothing. Direct interface cast for ClassA, no Keep.\n");
 

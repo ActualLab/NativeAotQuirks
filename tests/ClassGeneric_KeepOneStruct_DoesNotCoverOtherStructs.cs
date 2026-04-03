@@ -4,7 +4,6 @@ public static partial class Tests
 {
     public static void Run()
     {
-        CodeKeeper.Instance = new CodeKeeperBase();
         CodeKeeper.Keep<RareClass<StructA>>();
 
         Console.WriteLine("=== ClassGeneric_KeepOneStruct_DoesNotCoverOtherStructs ===");
