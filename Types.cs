@@ -3,8 +3,9 @@ namespace NativeAotQuirks;
 public class RareClass<T> { public T? Value; }
 public struct RareStruct<T> { public T? Value; }
 
-public class ClassA { public override string ToString() => "ClassA"; }
-public class ClassB { public override string ToString() => "ClassB"; }
+public class ClassBase { public override string ToString() => "ClassBase"; }
+public class ClassA : ClassBase { public override string ToString() => "ClassA"; }
+public class ClassB : ClassBase { public override string ToString() => "ClassB"; }
 public struct StructA { public int X; public override string ToString() => $"StructA({X})"; }
 public struct StructB { public string? Y; public override string ToString() => $"StructB({Y})"; }
 
@@ -12,6 +13,14 @@ public struct StructB { public string? Y; public override string ToString() => $
 public interface IRare<T> { T? Value { get; set; } }
 public class RareImpl<T> : IRare<T> { public T? Value { get; set; } }
 public class AnotherRareImpl<T> : IRare<T> { public T? Value { get; set; } }
+
+// Unreferenced type — never used directly in any test code
+public class UnreferencedType
+{
+    public string? Name { get; set; }
+    public int Compute(int x = 5) => x * 2;
+    public override string ToString() => $"UnreferencedType({Name})";
+}
 
 // Type with all kinds of members for comprehensive Keep(string) testing
 public class KitchenSink

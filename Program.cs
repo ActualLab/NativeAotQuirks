@@ -1,1 +1,1 @@
-Tests.Interface_KeepInterface_PreservesInterfaceMembers();
+Tests.Metadata_LiveCtorReference();

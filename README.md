@@ -76,17 +76,73 @@ This applies equally to `class Foo<T>` and `struct Foo<T>` — the sharing rules
 
 ### Interface retention
 
-| Scenario | Implementor ctor (via reflection) | Concrete member (via reflection) | Interface member (via reflection) |
-|---|---|---|---|
-| Keep `IRare<object>` only | **FAIL** — `MissingMethodException` | **NOT FOUND** — trimmed | **OK** — preserved on interface type |
-| Keep `IRare<object>` + direct `new RareImpl<object>()` | OK (ILC sees ctor) | **NOT FOUND** — trimmed | **OK** — invoke via interface `MethodInfo` |
-| Keep `RareImpl<object>` | OK | OK | OK |
-| Keep `RareImpl<object>`, test `AnotherRareImpl<object>` | **FAIL** — `MissingMethodException` | N/A | N/A |
+#### What does `Keep<IFoo<T>>()` preserve?
 
-Key findings:
-- Keeping an interface preserves the **interface method implementations** (`Type.InterfaceMethod` — the vtable/dispatch slot entries) and the **interface's own reflection metadata**. It does NOT preserve the **concrete type's own methods** (`Type.Method`) — even if `Type.Method` and `Type.InterfaceMethod` are backed by the same code. In other words, the method is preserved as an interface implementation but not as a standalone method on the concrete type. Its reflection metadata on the concrete type is also stripped.
-- To call interface members via reflection on a kept interface: resolve the `MethodInfo`/`PropertyInfo` from the **interface type**, then invoke it on the concrete instance. Resolving from the concrete type will fail (NOT FOUND) because the concrete type's metadata was trimmed.
-- Keeping one implementor does NOT cover other implementors of the same interface.
+For any interface method, there are effectively two entry points: `ConcreteType.Method` (the method as a member of the concrete type) and `ConcreteType.IFoo.Method` (the interface dispatch slot / vtable entry). These are backed by the same native code, but they have separate metadata and separate dispatch paths.
+
+`Keep<IFoo<object>>()` preserves:
+- The **interface dispatch implementation** (`ConcreteType.IFoo.Method`) — the vtable entries that make interface calls work
+- The **interface type's reflection metadata** — `typeof(IFoo<T>).GetProperty("Value")` returns a valid `PropertyInfo`
+
+It does NOT preserve:
+- The **concrete type's own reflection metadata** — `concreteInstance.GetType().GetProperty("Value")` returns null
+- The **concrete type's constructors** — `Activator.CreateInstance` fails with `MissingMethodException`
+
+#### Dispatch code vs reflection metadata
+
+| What you do | Preserves dispatch code? | Preserves reflection metadata? |
+|---|---|---|
+| `Keep<IRare<object>>()` | Yes | Yes (on interface type only) |
+| Direct interface call: `((IRare<T>)impl).Value` | Yes | **No** |
+| `new RareImpl<T>()` (direct ctor) | Ctor only | **No** |
+| `Keep<RareImpl<object>>()` | Yes | Yes (on concrete type) |
+
+Key insight: direct interface usage in code (`((IRare<T>)impl).Value = ...`) preserves the native code for dispatch but does **not** preserve reflection metadata — even on the interface type itself. Only `Keep<IRare<T>>()` (via `[DynamicallyAccessedMembers]`) preserves reflection metadata.
+
+#### Interface generic sharing
+
+| What's kept | `IRare<ClassA>` via reflection | `IRare<StructA>` via reflection |
+|---|---|---|
+| `Keep<IRare<object>>()` | **OK** — `__Canon` sharing | **OK** — also covered |
+| `Keep<IRare<ClassBase>>()` | **OK** — `__Canon` sharing | **OK** — also covered |
+| Nothing (just `new RareImpl<T>()`) | **NOT FOUND** | **NOT FOUND** |
+
+Keeping an interface with any reference type argument (e.g., `object`, `ClassBase`) preserves interface dispatch and reflection metadata for **all** type arguments — including value types. This is different from direct type retention where value types are never shared. Interface dispatch uses a different mechanism that covers all type args.
+
+#### Cross-implementor sharing
+
+| Scenario | Result |
+|---|---|
+| Keep `IRare<object>`, test `RareImpl<object>` ctor via reflection | **FAIL** — `MissingMethodException` (ctor trimmed) |
+| Keep `IRare<object>`, test `AnotherRareImpl<object>` ctor via reflection | **FAIL** — `MissingMethodException` (ctor trimmed) |
+| Keep `RareImpl<object>`, test `AnotherRareImpl<object>` | **FAIL** — keeping one implementor does not cover others |
+
+To call interface members via reflection: resolve the `MethodInfo`/`PropertyInfo` from the **interface type**, then invoke it on the concrete instance. Resolving from the concrete type will fail (NOT FOUND) because the concrete type's metadata was trimmed.
+
+### `IlcTrimMetadata` — native code vs reflection metadata
+
+NativeAOT treats code generation and metadata as **completely independent** concerns. Having native code for a member does NOT automatically preserve its reflection metadata (and vice versa).
+
+`<IlcTrimMetadata>true</IlcTrimMetadata>` is the default. When enabled, the trimmer strips reflection metadata from all members that aren't explicitly marked for retention — even if those members have native code. For example, `new MyType()` compiles to a direct `newobj` IL instruction that generates native code for the ctor, but the trimmer doesn't consider that a reason to keep the ctor's reflection metadata. So `Activator.CreateInstance(type)` will fail with `MissingMethodException` even though the ctor code exists and was just called.
+
+`<IlcTrimMetadata>false</IlcTrimMetadata>` preserves reflection metadata for every member that has native code. But it cannot preserve metadata for members with no code — if a method was never referenced and ILC didn't generate code for it, there's nothing to attach metadata to.
+
+| Scenario: `new UnreferencedType()` (live call) | `IlcTrimMetadata=true` | `IlcTrimMetadata=false` |
+|---|---|---|
+| `Type.GetType` | Found | Found |
+| `Activator.CreateInstance` (ctor) | **FAIL** — metadata stripped | OK |
+| `GetProperty("Name")` (has code via initializer) | **NOT FOUND** | Found |
+| `GetMethod("Compute")` (never called) | NOT FOUND | NOT FOUND |
+
+| Scenario: no references at all | `IlcTrimMetadata=true` | `IlcTrimMetadata=false` |
+|---|---|---|
+| `Type.GetType` | null — type eliminated entirely | null — type eliminated entirely |
+
+Key takeaways:
+- `IlcTrimMetadata` only affects types that have native code. Unreferenced types are eliminated entirely regardless of this setting.
+- With `IlcTrimMetadata=true`, you must use `CodeKeeper.Keep`, `[DynamicallyAccessedMembers]`, or `GetMembers(...)` to explicitly preserve metadata. Direct usage (`new`, method calls) generates code but not metadata.
+- With `IlcTrimMetadata=false`, metadata is automatically preserved for any member that has code. This is a blunt instrument — it increases binary size but avoids the need for explicit metadata retention.
+- `CodeKeeper.Keep` works correctly regardless of this setting — it provides targeted, per-type control over both code generation and metadata retention.
 
 ### Error diagnostics
 
@@ -142,6 +198,12 @@ NativeAOT tests are tricky because ILC performs whole-program analysis. Any type
 | `TestInterfaceMember(instance, interfaceType, name)` | Resolve a member from the interface type, invoke on the instance |
 | `TestInterfaceMembers(instance, interfaceType, names...)` | Batch version of `TestInterfaceMember` |
 | `Test(label, action)` | Run an action, print OK/FAIL with exception details |
+
+## Dependency Graph Analysis
+
+`IlcGenerateDgmlFile` is enabled in the project. After publishing, ILC generates a `.dgml.xml` file in `obj/Release/net10.0/win-x64/native/` that contains the full dependency graph — every type, method, and reason it was included. Open it in Visual Studio or parse it to understand why a specific type or member was kept or trimmed.
+
+Useful for debugging unexpected behavior, e.g., "why does this type have code but no ctor metadata?" — search for the type in the DGML to see what referenced it and through which dependency path.
 
 ## Building and Running
 
