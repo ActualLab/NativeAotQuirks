@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <PublishAot>true</PublishAot>
+    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>NativeAotQuirks</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Using Include="NativeAotQuirks" />
+    <Using Include="NativeAotQuirks.Helpers" Static="True" />
+  </ItemGroup>
+</Project>

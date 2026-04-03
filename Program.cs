@@ -1,0 +1,1 @@
+Tests.CodeKeeper_KeepGeneric_PreservesAllMembers();
