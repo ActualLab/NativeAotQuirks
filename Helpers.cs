@@ -92,6 +92,56 @@ public static class Helpers
         Console.WriteLine($"    {memberName}: NOT FOUND");
     }
 
+    public static void TestInterfaceMembers(object instance, Type interfaceType, params string[] memberNames)
+    {
+        foreach (var memberName in memberNames)
+            TestInterfaceMember(instance, interfaceType, memberName);
+    }
+
+    public static void TestInterfaceMember(object instance, Type interfaceType, string memberName)
+    {
+        interfaceType = M(interfaceType);
+        var flags = System.Reflection.BindingFlags.Instance
+            | System.Reflection.BindingFlags.Public
+            | System.Reflection.BindingFlags.NonPublic;
+
+        var prop = interfaceType.GetProperty(memberName, flags);
+        if (prop != null)
+        {
+            if (prop.GetMethod != null)
+            {
+                var val = prop.GetMethod.Invoke(instance, null);
+                Console.WriteLine($"    Property {memberName}: get OK ({val})");
+            }
+            if (prop.SetMethod != null)
+            {
+                var defaultVal = prop.PropertyType.IsValueType ? Activator.CreateInstance(prop.PropertyType) : null;
+                prop.SetMethod.Invoke(instance, [defaultVal]);
+                Console.WriteLine($"    Property {memberName}: set OK");
+            }
+            return;
+        }
+
+        var method = interfaceType.GetMethod(memberName, flags);
+        if (method != null)
+        {
+            var parameters = method.GetParameters();
+            var args = new object?[parameters.Length];
+            for (var i = 0; i < parameters.Length; i++)
+            {
+                var pt = parameters[i].ParameterType;
+                args[i] = parameters[i].HasDefaultValue
+                    ? parameters[i].DefaultValue
+                    : pt.IsValueType ? Activator.CreateInstance(pt) : null;
+            }
+            var result = method.Invoke(instance, args);
+            Console.WriteLine($"    Method {memberName}: call OK ({result})");
+            return;
+        }
+
+        Console.WriteLine($"    {memberName}: NOT FOUND");
+    }
+
     public static void Test(string title, Func<object> action)
     {
         try

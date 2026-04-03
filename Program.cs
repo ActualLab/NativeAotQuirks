@@ -1,1 +1,1 @@
-Tests.CodeKeeper_KeepGeneric_PreservesAllMembers();
+Tests.Interface_KeepInterface_PreservesInterfaceMembers();

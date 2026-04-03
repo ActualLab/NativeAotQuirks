@@ -8,6 +8,11 @@ public class ClassB { public override string ToString() => "ClassB"; }
 public struct StructA { public int X; public override string ToString() => $"StructA({X})"; }
 public struct StructB { public string? Y; public override string ToString() => $"StructB({Y})"; }
 
+// Interface + implementation generics for sharing tests
+public interface IRare<T> { T? Value { get; set; } }
+public class RareImpl<T> : IRare<T> { public T? Value { get; set; } }
+public class AnotherRareImpl<T> : IRare<T> { public T? Value { get; set; } }
+
 // Type with all kinds of members for comprehensive Keep(string) testing
 public class KitchenSink
 {

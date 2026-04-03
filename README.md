@@ -1,187 +1,159 @@
-# NativeAOT Code Generation: What We Learned
+# NativeAOT Quirks
 
-## The Core Problem
+A test project for experimenting with NativeAOT code generation, trimming, and type retention. Contains `CodeKeeper` — a reusable utility for forcing NativeAOT to preserve types and their members.
 
-NativeAOT compiles all code ahead of time. When framework code creates closed generic types at runtime via `MakeGenericType` + `Activator.CreateInstance`, the AOT compiler never sees these types statically, so it doesn't generate native code for them. At runtime, this fails with:
+## CodeKeeper
 
-```
-NotSupportedException: 'SomeType`1[T]' is missing native code or metadata.
-```
+`CodeKeeper` provides two methods to force NativeAOT to retain native code and metadata for types that would otherwise be trimmed:
 
-vs. when code IS present but constructor metadata was trimmed:
+### `Keep<T>()` — for accessible types
 
-```
-MissingMethodException: No parameterless constructor defined for type 'SomeType`1[T]'.
-```
-
-The error type is the key diagnostic: `NotSupportedException` = no native code, `MissingMethodException` = code exists but trimmer stripped the constructor.
-
-## How to Force Code Generation
-
-### `Type.GetType("...", assembly)` with string literals
-
-ILC (the NativeAOT IL Compiler) analyzes `Type.GetType` string literals at compile time and generates native code for the types they reference. This is the primary mechanism we found for forcing code generation of internal/inaccessible closed generic types.
+Uses `[DynamicallyAccessedMembers(All)]` on the type parameter to tell the trimmer to preserve all members of `T`.
 
 ```csharp
-// ILC sees this literal and generates native code for the closed generic
-Type.GetType("Some.Internal.Converter`1[[MyType, MyAssembly]], TargetAssembly");
+CodeKeeper.Keep<MyClass>();
+CodeKeeper.Keep<RareClass<SomeType>>();
 ```
 
-**Important:** only `Type.GetType` works — `Assembly.GetType` does NOT trigger code generation.
+### `Keep(string)` — for internal/inaccessible types
 
-**Important:** the string must be a compile-time literal. If you build it at runtime (e.g., via `string.Concat`), ILC can't analyze it.
-
-### `new T()` / direct usage in code
-
-Direct usage of a type in code (even behind an always-false branch) forces code generation:
+Uses `Type.GetType(literal)` in a dead branch to force ILC to generate native code. However, `Type.GetType` alone generates code but does **not** preserve member metadata — the trimmer strips constructors, properties, methods, etc. To preserve members, the result must be followed by `.GetMembers(...)` calls covering all binding flag combinations:
 
 ```csharp
-static readonly bool AlwaysFalse = Random.Shared.NextDouble() > 10;
-
-if (AlwaysFalse)
-{
-    _ = new MyClass<SomeType>();  // forces codegen
-}
+if (AlwaysTrue) return;
+var t = Type.GetType(assemblyQualifiedTypeName);
+t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.CreateInstance);
+t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
 ```
 
-This works for class generics but NOT for struct generics — `new SomeStruct<T>()` is just zero-initialization and doesn't generate constructor/method code.
+The string must be a compile-time literal at the **call site** — ILC analyzes it statically. The `[DynamicallyAccessedMembers(All)]` attribute on the parameter also helps the trimmer propagate metadata requirements.
 
-### What does NOT work
+```csharp
+CodeKeeper.Keep("Namespace.InternalType`1[[ArgType, ArgAssembly]], TargetAssembly");
+```
 
-| Mechanism | Preserves metadata? | Generates native code? |
+### `AlwaysFalse` / `AlwaysTrue`
+
+Public fields used for dead branches that ILC can't eliminate:
+
+```csharp
+public static readonly bool AlwaysFalse = Random.Shared.NextDouble() > 2;
+public static readonly bool AlwaysTrue = !AlwaysFalse;
+```
+
+Since these are evaluated at runtime, ILC must assume either branch is reachable and generate code for both.
+
+## Findings
+
+### Type retention mechanisms
+
+| Mechanism | Generates native code? | Preserves members? |
 |---|---|---|
-| `[DynamicDependency(All, typeof(ClosedGeneric))]` | Yes | Yes (only with `typeof()`, not string) |
-| `[DynamicDependency(All, "TypeName", "Assembly")]` | Yes | **No** |
-| `rd.xml` with `Dynamic="Required All"` | Yes | **No** |
-| `Assembly.GetType("literal string")` | Depends on trimming | **No** |
-| `[DynamicallyAccessedMembers]` on constraints | Preserves members | Yes (for constructors/members of the annotated type) |
+| `Type.GetType("literal")` alone | Yes | **No** — trimmer strips constructors/members |
+| `Type.GetType("literal").GetConstructors()` | Yes | Constructors only |
+| `Type.GetType("literal").GetMembers(...)` | Yes | Yes — must cover all binding flag combos |
+| `[DynamicallyAccessedMembers(All)]` on generic `T` | Yes | Yes |
+| `[DynamicDependency(All, typeof(T))]` | Yes | Yes |
+| `[DynamicDependency(All, "TypeName", "Assembly")]` | **No** | Yes (metadata only) |
+| `Assembly.GetType("literal")` | **No** | **No** |
+| `Activator.CreateInstance(type)` in dead branch | No additional effect | **No** — trimmer can't trace runtime `Type` |
+| `[DynamicallyAccessedMembers]` on string param | No additional effect | **No** — annotation doesn't apply to strings |
 
-`[DynamicDependency]` with a `typeof()` reference works because `typeof()` emits a type token in IL that ILC treats as a direct reference. The string overload only affects trimming, not code generation.
+### Generic sharing (Universal Shared Generics)
 
-## Generic Sharing Rules
+Both class and struct generics share code for reference type arguments via `__Canon`. Neither shares code between different value type arguments — each struct `T` needs its own explicit retention.
 
-NativeAOT uses Universal Shared Generics (USG) for reference types. The sharing behavior differs between class and struct generics:
+| Scenario | What's kept | What works at runtime |
+|---|---|---|
+| `Keep<Foo<object>>()` | `Foo<object>` | `Foo<AnyRefType>` — all ref types share via `__Canon` |
+| `Keep<Foo<StructA>>()` | `Foo<StructA>` | `Foo<StructA>` only — `Foo<StructB>` fails |
+| `Keep<Foo<object>>()` + `Keep<Foo<StructA>>()` | Both | All ref types + `StructA` only — `StructB` still fails |
 
-### Class generics (`class Foo<T>`)
+This applies equally to `class Foo<T>` and `struct Foo<T>` — the sharing rules are the same.
 
-| What you retain | What works at runtime |
+**Correction from earlier assumptions:** the original hypothesis that "one struct instantiation covers all structs for class generics" was disproven experimentally. Each distinct value type argument requires explicit retention regardless of whether the generic is a class or struct.
+
+### Interface retention
+
+| Scenario | Implementor ctor (via reflection) | Concrete member (via reflection) | Interface member (via reflection) |
+|---|---|---|---|
+| Keep `IRare<object>` only | **FAIL** — `MissingMethodException` | **NOT FOUND** — trimmed | **OK** — preserved on interface type |
+| Keep `IRare<object>` + direct `new RareImpl<object>()` | OK (ILC sees ctor) | **NOT FOUND** — trimmed | **OK** — invoke via interface `MethodInfo` |
+| Keep `RareImpl<object>` | OK | OK | OK |
+| Keep `RareImpl<object>`, test `AnotherRareImpl<object>` | **FAIL** — `MissingMethodException` | N/A | N/A |
+
+Key findings:
+- Keeping an interface preserves the **interface dispatch slots** (native code for the interface method implementations) and the **interface's reflection metadata**, but does NOT preserve constructors or reflection metadata on concrete implementations.
+- To call interface members via reflection on a kept interface: resolve the `MethodInfo`/`PropertyInfo` from the **interface type**, then invoke it on the concrete instance.
+- Keeping one implementor does NOT cover other implementors of the same interface.
+
+### Error diagnostics
+
+| Error | Meaning |
 |---|---|
-| `Foo<object>` | `Foo<AnyReferenceType>` — all ref types share code via `__Canon` |
-| `Foo<OneStructType>` | `Foo<AnyStructType>` — one struct instantiation provides a template for all |
-| `Foo<object>` + `Foo<AnyOneStruct>` | Everything — full coverage |
+| `NotSupportedException: 'Type' is missing native code` | ILC didn't generate native code for this type at all |
+| `MissingMethodException: No parameterless constructor` | Native code exists (possibly via `__Canon` sharing) but the trimmer stripped constructor metadata |
 
-Key finding: for class generics, retaining a single value-type instantiation provides a template that covers ALL value types. This is surprising but confirmed experimentally.
+The error type is the key diagnostic — `NotSupportedException` means you need to force code generation (e.g., `Type.GetType` literal or `Keep<T>`), while `MissingMethodException` means you need to preserve metadata (e.g., `.GetMembers(...)` or `[DynamicallyAccessedMembers]`).
 
-### Struct generics (`struct Bar<T>`)
+## Writing Clean Tests
 
-| What you retain | What works at runtime |
+NativeAOT tests are tricky because ILC performs whole-program analysis. Any type reference anywhere in the compiled assembly can cause ILC to generate code for it, contaminating the test. Clean tests must ensure that **only** the `Keep(...)` / `CodeKeeper.Keep<T>()` call signals type retention — nothing else in the test should give ILC hints.
+
+### Isolation rules
+
+1. **Run one test at a time.** Edit `Program.cs` to call a single test method. Even commented-out code in other test methods is compiled into the assembly — if another test calls `Keep<RareClass<ClassA>>()`, ILC sees it and generates code, contaminating your test.
+
+2. **Never reference the type under test directly.** Use `ActivateGeneric(typeof(RareClass<>), typeof(ClassA))` instead of `new RareClass<ClassA>()`. The open generic `typeof(RareClass<>)` doesn't trigger codegen for any closed instantiation — only the `Keep(...)` call should do that.
+
+3. **Use `M()` to obscure values from ILC.** The helper `M<T>(T value)` passes the value through an array round-trip that ILC can't analyze statically. Use it to prevent ILC from tracing type information:
+   ```csharp
+   // ILC can trace this:
+   var type = Type.GetType("MyType, MyAssembly");
+   // ILC cannot trace this:
+   var type = Type.GetType(M("MyType, MyAssembly"));
+   ```
+
+4. **Cast to `object` before passing to helpers.** When you must construct a type directly (e.g., to test interface dispatch), cast to `object` via `M()` so ILC can't see the concrete type flowing into member-testing helpers:
+   ```csharp
+   var impl = M((object)new RareImpl<object>());  // ILC sees ctor, but not member usage
+   TestMember(impl, "Value");  // ILC sees TestMember(object, string), not the concrete type
+   ```
+
+5. **Test interface members via `TestInterfaceMember`.** Instead of casting to the interface and calling members directly (which gives ILC a direct reference), resolve the member from the interface `Type` via reflection and invoke it on the instance:
+   ```csharp
+   // Bad — ILC sees the interface call and preserves the member:
+   ((IRare<object>)impl).Value = "test";
+
+   // Good — only the Keep(...) call determines what's preserved:
+   TestInterfaceMember(impl, typeof(IRare<object>), "Value");
+   ```
+
+### Test helpers
+
+| Helper | Purpose |
 |---|---|
-| `Bar<object>` | **Only** `Bar<object>` — no sharing with other ref types |
-| `Bar<StructA>` | **Only** `Bar<StructA>` — no sharing with other structs |
-| `Bar<StructA>` + `Bar<StructB>` | Only those two specific instantiations |
+| `M<T>(value)` | Obscure a value from ILC's static analysis |
+| `ActivateGeneric(openType, typeArgs...)` | Create a closed generic instance via `MakeGenericType` + `Activator.CreateInstance` |
+| `Activate(type, ctorArgTypes...)` | Find and invoke a constructor (public or private) via reflection |
+| `TestMember(instanceOrType, name)` | Exercise a field/property/method on a concrete type via reflection |
+| `TestMembers(instanceOrType, names...)` | Batch version of `TestMember` |
+| `TestInterfaceMember(instance, interfaceType, name)` | Resolve a member from the interface type, invoke on the instance |
+| `TestInterfaceMembers(instance, interfaceType, names...)` | Batch version of `TestInterfaceMember` |
+| `Test(label, action)` | Run an action, print OK/FAIL with exception details |
 
-Struct generics have **no sharing at all**. Every distinct type argument needs its own explicitly retained instantiation. This includes reference type arguments — `Bar<object>` does NOT cover `Bar<SomeClass>`.
+## Building and Running
 
-### Why struct generics can't share
-
-Struct generics embed the layout of `T` directly. The runtime needs exact method tables and field offsets for each instantiation. Class generics store references (pointers) regardless of `T`, enabling code sharing.
-
-## Controlling Constructor Preservation
-
-Even when native code is generated, the trimmer may strip constructor metadata needed by `Activator.CreateInstance`. Solutions:
-
-### `[DynamicallyAccessedMembers(All)]` on generic constraints
-
-```csharp
-static void KeepComponent<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)] T>()
-    where T : new()
-{
-    if (AlwaysFalse)
-        _ = new T();
-}
+```cmd
+PublishAndRun.cmd
 ```
 
-### Direct `new` in always-false branch
-
-For class generics, `new MyClass<T>()` in a dead branch preserves both native code AND the constructor.
-
-## Practical Pattern: CodeKeeper
-
-Combine all techniques in a single class:
-
-```csharp
-public static class CodeKeeper
-{
-    static readonly bool AlwaysFalse = Random.Shared.NextDouble() > 10;
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    public static void Keep()
-    {
-        // Preserve Blazor component constructors
-        KeepComponent<MyComponent>();
-
-        if (AlwaysFalse)
-        {
-            // Force codegen for internal closed generics via Type.GetType literals
-            Type.GetType("Namespace.InternalType`1[[ArgType, ArgAssembly]], TargetAssembly");
-
-            // Force codegen for accessible types via direct usage
-            _ = new MyClass<object>();      // covers all ref type args
-            _ = new MyClass<SomeStruct>();  // covers all struct args (for class generics)
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    static void KeepComponent<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)] T>()
-        where T : new()
-    {
-        if (AlwaysFalse)
-            _ = new T();
-    }
-}
-```
-
-Call `CodeKeeper.Keep()` early in app startup.
-
-## `AlwaysFalse` Pattern
-
-The compiler must believe the branch is reachable for it to analyze string literals and generate code. Use:
-
-```csharp
-static readonly bool AlwaysFalse = Random.Shared.NextDouble() > 10;
-```
-
-This is evaluated at runtime, so the compiler can't prove it's false. Alternatives like `volatile bool` also work but are less clean. A simple `const bool` or `if (false)` would be dead-code eliminated.
-
-## Discovering Missing Types
-
-Add a first-chance exception handler to log all failures:
-
-```csharp
-AppDomain.CurrentDomain.FirstChanceException += (sender, args) =>
-{
-    Log($"FIRST-CHANCE: {args.Exception}");
-};
-```
-
-Then grep for `"is missing native code"` in the log. The type names in the error messages are the exact types you need to add to `CodeKeeper`.
-
-## Additional MSBuild Properties
-
-For MAUI Blazor apps with NativeAOT:
-
-```xml
-<PropertyGroup Condition="windows">
-    <PublishAot>true</PublishAot>
-    <!-- BlazorWebView IPC uses reflection-based JSON serialization -->
-    <JsonSerializerIsReflectionEnabledByDefault>true</JsonSerializerIsReflectionEnabledByDefault>
-</PropertyGroup>
-```
-
-## Publishing
-
-`vswhere.exe` must be on PATH for the native linker to find MSVC tools:
+Or manually:
 
 ```bash
 PATH="/c/Program Files (x86)/Microsoft Visual Studio/Installer:$PATH" dotnet publish -c Release
+bin\Release\net10.0\win-x64\publish\NativeAotQuirks.exe
 ```
+
+Edit `Program.cs` to select which test to run — only one test should be active at a time to avoid cross-contamination of type retention between tests.
