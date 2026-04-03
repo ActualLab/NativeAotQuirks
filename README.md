@@ -84,8 +84,8 @@ This applies equally to `class Foo<T>` and `struct Foo<T>` — the sharing rules
 | Keep `RareImpl<object>`, test `AnotherRareImpl<object>` | **FAIL** — `MissingMethodException` | N/A | N/A |
 
 Key findings:
-- Keeping an interface preserves the **interface dispatch slots** (native code for the interface method implementations) and the **interface's reflection metadata**, but does NOT preserve constructors or reflection metadata on concrete implementations.
-- To call interface members via reflection on a kept interface: resolve the `MethodInfo`/`PropertyInfo` from the **interface type**, then invoke it on the concrete instance.
+- Keeping an interface preserves the **interface method implementations** (`Type.InterfaceMethod` — the vtable/dispatch slot entries) and the **interface's own reflection metadata**. It does NOT preserve the **concrete type's own methods** (`Type.Method`) — even if `Type.Method` and `Type.InterfaceMethod` are backed by the same code. In other words, the method is preserved as an interface implementation but not as a standalone method on the concrete type. Its reflection metadata on the concrete type is also stripped.
+- To call interface members via reflection on a kept interface: resolve the `MethodInfo`/`PropertyInfo` from the **interface type**, then invoke it on the concrete instance. Resolving from the concrete type will fail (NOT FOUND) because the concrete type's metadata was trimmed.
 - Keeping one implementor does NOT cover other implementors of the same interface.
 
 ### Error diagnostics
