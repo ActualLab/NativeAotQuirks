@@ -1,18 +1,18 @@
 # NativeAOT Quirks
 
-A test project for experimenting with NativeAOT code generation, trimming, and type retention. Contains `CodeKeeper` — a reusable utility for forcing NativeAOT to preserve types and their members.
+A test project for experimenting with NativeAOT code generation, trimming, and type retention. Contains `CodeKeeper` — an extendable utility for forcing NativeAOT to preserve types and their members.
 
 ## CodeKeeper
 
-`CodeKeeper` provides two methods to force NativeAOT to retain native code and metadata for types that would otherwise be trimmed:
+`CodeKeeper` is a static facade that delegates to `CodeKeeper.Instance` (a `CodeKeeperImpl`). The base class provides core `Keep` methods; `CodeKeeperAdvanced` extends it with higher-level helpers like `KeepResult<T>()` and `KeepReturnType<T>()`.
+
+The core retention methods combine two complementary mechanisms:
+1. `[DynamicallyAccessedMembers(All)]` — tells the trimmer to preserve reflection metadata
+2. `typeof(T).GetMembers(...)` / `Type.GetType(literal).GetMembers(...)` in dead branches — forces ILC to generate native code
+
+Both are necessary. The annotation alone preserves metadata but does **not** force code generation for struct generics with value type arguments (e.g., `Result<StructA>`). The dead-branch reflection calls force ILC to see the concrete type and generate code.
 
 ### `Keep<T>()` — for accessible types
-
-Uses two complementary mechanisms:
-1. `[DynamicallyAccessedMembers(All)]` on `T` — tells the trimmer to preserve reflection metadata
-2. `typeof(T).GetConstructors()` + `typeof(T).GetMembers(...)` in a dead branch — forces ILC to generate native code
-
-Both are necessary. The annotation alone preserves metadata but does **not** force code generation for struct generics with value type arguments (e.g., `Result<StructA>`). The `typeof(T).GetMembers(...)` calls in the dead branch force ILC to see the concrete type and generate code for it.
 
 ```csharp
 [MethodImpl(MethodImplOptions.NoInlining)]
@@ -34,7 +34,7 @@ CodeKeeper.Keep<RareClass<SomeType>>();
 
 ### `Keep(string)` — for internal/inaccessible types
 
-Uses `[DynamicallyAccessedMembers(All)]` on the string parameter plus `Type.GetType(literal).GetMembers(...)` in a dead branch. The annotation tells the trimmer to preserve metadata; the `Type.GetType` + `GetMembers` calls force code generation.
+Same two mechanisms, but using `Type.GetType(literal)` instead of `typeof(T)` since the type can't be referenced directly.
 
 ```csharp
 [MethodImpl(MethodImplOptions.NoInlining)]
@@ -121,66 +121,62 @@ DGML confirms this: when `WrappedKeep<T>()` lacks the annotation, its "Dataflow 
 
 ### Composing `Keep` for complex type patterns
 
-Since annotations propagate correctly across method boundaries (as long as every link carries `[DynamicallyAccessedMembers(All)]`), you can build higher-level retention helpers that compose `Keep<T>()` calls:
+Since annotations propagate correctly across method boundaries (as long as every link carries `[DynamicallyAccessedMembers(All)]`), higher-level retention helpers can compose `Keep<T>()` calls. `CodeKeeperAdvanced` provides these:
 
 ```csharp
-// Keep T and all its common return type wrappers
-public static void KeepReturnType<[DynamicallyAccessedMembers(All)] T>()
+public class CodeKeeperAdvanced : CodeKeeperImpl
 {
-    Keep<T>();
-    Keep<Result<T>>();
-    Keep<Task<T>>();
-    Keep<Task<Result<T>>>();
-    Keep<ValueTask<T>>();
-    Keep<ValueTask<Result<T>>>();
-}
+    public override void KeepResult<[DynamicallyAccessedMembers(All)] T>()
+    {
+        Keep<T>();
+        Keep<Result<T>>();
+    }
 
-// Keep multiple types at once
-public static void KeepReturnTypes<
-    [DynamicallyAccessedMembers(All)] T1,
-    [DynamicallyAccessedMembers(All)] T2,
-    [DynamicallyAccessedMembers(All)] T3>()
-{
-    KeepReturnTypes<T1, T2>();
-    KeepReturnType<T3>();
+    public override void KeepReturnType<[DynamicallyAccessedMembers(All)] T>()
+    {
+        KeepResult<T>();
+        Keep<Task<T>>();
+        Keep<Task<Result<T>>>();
+        Keep<ValueTask<T>>();
+        Keep<ValueTask<Result<T>>>();
+    }
 }
 ```
 
 This works because:
 1. Each method in the chain has `[DynamicallyAccessedMembers(All)]` on its type parameters — the annotation chain is unbroken
-2. `Keep<T>()` uses `typeof(T).GetMembers(...)` in a dead branch — this forces code generation even for nested struct generics like `ValueTask<Result<StructA>>`
+2. The base `Keep<T>()` uses `typeof(T).GetMembers(...)` in a dead branch — this forces code generation even for nested struct generics like `ValueTask<Result<StructA>>`
 3. The trimmer traces through the entire call graph: `KeepReturnTypes<StructA, StructB, StructC>()` → `KeepReturnType<StructA>()` → `Keep<Result<StructA>>()` → `typeof(Result<StructA>).GetMembers(...)`
 
 Tested with `KeepReturnTypes<StructA, StructB, StructC>()` — all 18 combinations (3 types x 6 wrappers) produce native code and preserve metadata, including deeply nested struct generics like `ValueTask<Result<StructC>>`.
 
 ### Virtual dispatch and the `CodeKeeper.Instance` pattern
 
-`CodeKeeper` is a static facade that delegates to `CodeKeeper.Instance` (a `CodeKeeperImpl`). The base class `CodeKeeperImpl` implements basic `Keep` methods with the `typeof(T).GetMembers(...)` dead-branch pattern, while `KeepResult`/`KeepReturnType`/`KeepReturnTypes` are empty stubs. `CodeKeeperAdvanced` overrides those stubs with real implementations that compose `Keep<T>()` calls.
+The `CodeKeeperImpl` base class has empty stubs for `KeepResult`/`KeepReturnType`/`KeepReturnTypes`. `CodeKeeperAdvanced` overrides them with real implementations. To enable the advanced methods, assign the instance before calling them:
 
 ```csharp
-// In test setup:
-CodeKeeper.Instance = new CodeKeeperAdvanced();  // enables KeepResult/KeepReturnType
+CodeKeeper.Instance = new CodeKeeperAdvanced();
 CodeKeeper.KeepReturnTypes<StructA, StructB, StructC>();
 ```
 
 Key findings:
 - **Virtual dispatch preserves annotations.** `[DynamicallyAccessedMembers(All)]` on virtual method parameters propagates correctly through overrides — the trimmer analyzes the actual override body that ILC compiles.
-- **The override must be instantiated.** If `CodeKeeperAdvanced` is never allocated (i.e., only `CodeKeeperImpl` is used), ILC never compiles the override bodies, and `KeepResult<T>()` calls the base empty stub — nothing is preserved. Tested: `KeepResult_StructA_NoAdvanced` confirms all `Result<T>` fail with `NotSupportedException` when using `CodeKeeperImpl` directly.
+- **The override must be instantiated.** If `CodeKeeperAdvanced` is never allocated, ILC never compiles the override bodies, and `KeepResult<T>()` calls the base empty stub — nothing is preserved. Tested: `KeepResult_StructA_NoAdvanced` confirms all `Result<T>` fail with `NotSupportedException` when using the default `CodeKeeperImpl`.
 - **This enables modular code keeping.** A library can ship `CodeKeeperImpl` with basic `Keep` methods. An application can extend it with `CodeKeeperAdvanced` that knows about application-specific type patterns (e.g., `Result<T>`, `Task<Result<T>>`). The annotations propagate correctly through the inheritance chain.
 
 ### Generic sharing (Universal Shared Generics)
 
-Both class and struct generics share code for reference type arguments via `__Canon`. Neither shares code between different value type arguments — each struct `T` needs its own explicit retention.
+NativeAOT uses **type erasure** for reference type arguments: all ref types are replaced with `System.__Canon` (the canonical reference type). This means `Foo<object>`, `Foo<ClassA>`, and `Foo<ClassB>` all share the same native code — a single `Foo<__Canon>` implementation handles them all. Keeping any one ref-type instantiation covers all ref-type instantiations.
+
+Value types cannot be erased — each has a different size, layout, and method table. `Foo<StructA>` and `Foo<StructB>` require completely separate native code. There is no sharing between value type arguments.
 
 | Scenario | What's kept | What works at runtime |
 |---|---|---|
-| `Keep<Foo<object>>()` | `Foo<object>` | `Foo<AnyRefType>` — all ref types share via `__Canon` |
+| `Keep<Foo<object>>()` | `Foo<__Canon>` | `Foo<AnyRefType>` — all ref types share via `__Canon` |
 | `Keep<Foo<StructA>>()` | `Foo<StructA>` | `Foo<StructA>` only — `Foo<StructB>` fails |
 | `Keep<Foo<object>>()` + `Keep<Foo<StructA>>()` | Both | All ref types + `StructA` only — `StructB` still fails |
 
-This applies equally to `class Foo<T>` and `struct Foo<T>` — the sharing rules are the same.
-
-**Correction from earlier assumptions:** the original hypothesis that "one struct instantiation covers all structs for class generics" was disproven experimentally. Each distinct value type argument requires explicit retention regardless of whether the generic is a class or struct.
+This applies equally to `class Foo<T>` and `struct Foo<T>` — the sharing rules are the same. Each distinct value type argument requires explicit retention.
 
 ### Interface retention
 
@@ -413,3 +409,16 @@ Run.cmd
 ```
 
 Each test is a separate file in `tests/` with a `partial class Tests` containing a single `Run()` method. Only one test is compiled at a time (selected via the `TestName` MSBuild property) to ensure complete isolation.
+
+To run all tests sequentially (bash):
+
+```bash
+export PATH="/c/Program Files (x86)/Microsoft Visual Studio/Installer:$PATH"
+for test in tests/[A-Z]*.cs; do
+    name=$(basename "$test" .cs)
+    [ "$name" = "NoTestName" ] && continue
+    echo "========== $name =========="
+    dotnet publish -c Release -p:TestName="$name" 2>&1 | grep -v warning | tail -1
+    bin/Release/net10.0/win-x64/publish/NativeAotQuirks.exe
+done
+```
