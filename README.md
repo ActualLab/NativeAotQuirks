@@ -153,6 +153,21 @@ This works because:
 
 Tested with `KeepReturnTypes<StructA, StructB, StructC>()` — all 18 combinations (3 types x 6 wrappers) produce native code and preserve metadata, including deeply nested struct generics like `ValueTask<Result<StructC>>`.
 
+### Virtual dispatch and the `CodeKeeper.Instance` pattern
+
+`CodeKeeper` is a static facade that delegates to `CodeKeeper.Instance` (a `CodeKeeperImpl`). The base class `CodeKeeperImpl` implements basic `Keep` methods with the `typeof(T).GetMembers(...)` dead-branch pattern, while `KeepResult`/`KeepReturnType`/`KeepReturnTypes` are empty stubs. `CodeKeeperAdvanced` overrides those stubs with real implementations that compose `Keep<T>()` calls.
+
+```csharp
+// In test setup:
+CodeKeeper.Instance = new CodeKeeperAdvanced();  // enables KeepResult/KeepReturnType
+CodeKeeper.KeepReturnTypes<StructA, StructB, StructC>();
+```
+
+Key findings:
+- **Virtual dispatch preserves annotations.** `[DynamicallyAccessedMembers(All)]` on virtual method parameters propagates correctly through overrides — the trimmer analyzes the actual override body that ILC compiles.
+- **The override must be instantiated.** If `CodeKeeperAdvanced` is never allocated (i.e., only `CodeKeeperImpl` is used), ILC never compiles the override bodies, and `KeepResult<T>()` calls the base empty stub — nothing is preserved. Tested: `KeepResult_StructA_NoAdvanced` confirms all `Result<T>` fail with `NotSupportedException` when using `CodeKeeperImpl` directly.
+- **This enables modular code keeping.** A library can ship `CodeKeeperImpl` with basic `Keep` methods. An application can extend it with `CodeKeeperAdvanced` that knows about application-specific type patterns (e.g., `Result<T>`, `Task<Result<T>>`). The annotations propagate correctly through the inheritance chain.
+
 ### Generic sharing (Universal Shared Generics)
 
 Both class and struct generics share code for reference type arguments via `__Canon`. Neither shares code between different value type arguments — each struct `T` needs its own explicit retention.
