@@ -1,1 +1,1 @@
-Tests.Metadata_LiveCtorReference();
+Tests.Run();

@@ -8,7 +8,24 @@ A test project for experimenting with NativeAOT code generation, trimming, and t
 
 ### `Keep<T>()` — for accessible types
 
-Uses `[DynamicallyAccessedMembers(All)]` on the type parameter to tell the trimmer to preserve all members of `T`.
+Uses two complementary mechanisms:
+1. `[DynamicallyAccessedMembers(All)]` on `T` — tells the trimmer to preserve reflection metadata
+2. `typeof(T).GetConstructors()` + `typeof(T).GetMembers(...)` in a dead branch — forces ILC to generate native code
+
+Both are necessary. The annotation alone preserves metadata but does **not** force code generation for struct generics with value type arguments (e.g., `Result<StructA>`). The `typeof(T).GetMembers(...)` calls in the dead branch force ILC to see the concrete type and generate code for it.
+
+```csharp
+[MethodImpl(MethodImplOptions.NoInlining)]
+public static void Keep<[DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)] T>()
+{
+    if (AlwaysTrue) return;
+    var t = typeof(T);
+    t.GetConstructors();
+    t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.CreateInstance);
+    t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+    t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+}
+```
 
 ```csharp
 CodeKeeper.Keep<MyClass>();
@@ -17,20 +34,39 @@ CodeKeeper.Keep<RareClass<SomeType>>();
 
 ### `Keep(string)` — for internal/inaccessible types
 
-Uses `Type.GetType(literal)` in a dead branch to force ILC to generate native code. However, `Type.GetType` alone generates code but does **not** preserve member metadata — the trimmer strips constructors, properties, methods, etc. To preserve members, the result must be followed by `.GetMembers(...)` calls covering all binding flag combinations:
+Uses `[DynamicallyAccessedMembers(All)]` on the string parameter plus `Type.GetType(literal).GetMembers(...)` in a dead branch. The annotation tells the trimmer to preserve metadata; the `Type.GetType` + `GetMembers` calls force code generation.
 
 ```csharp
-if (AlwaysTrue) return;
-var t = Type.GetType(assemblyQualifiedTypeName);
-t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.CreateInstance);
-t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+[MethodImpl(MethodImplOptions.NoInlining)]
+public static void Keep(
+    [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)] string assemblyQualifiedTypeName)
+{
+    if (AlwaysTrue) return;
+    var t = Type.GetType(assemblyQualifiedTypeName);
+    t.GetConstructors();
+    t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.CreateInstance);
+    t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+    t.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+}
 ```
 
-The string must be a compile-time literal at the **call site** — ILC analyzes it statically. The `[DynamicallyAccessedMembers(All)]` attribute on the parameter also helps the trimmer propagate metadata requirements.
+The string must be a compile-time literal at the **call site** — ILC's dataflow analysis traces the value statically. If the string passes through an intermediary method parameter, the chain breaks and nothing is preserved.
 
 ```csharp
+// Works — literal flows directly to [DynamicallyAccessedMembers] parameter:
 CodeKeeper.Keep("Namespace.InternalType`1[[ArgType, ArgAssembly]], TargetAssembly");
+
+// Does NOT work — intermediary method breaks the dataflow chain:
+void Wrapper(string s) => CodeKeeper.Keep(s);
+Wrapper("Namespace.InternalType`1[[ArgType, ArgAssembly]], TargetAssembly");
+```
+
+A wrapper method works only if its own parameter also carries `[DynamicallyAccessedMembers(All)]`:
+
+```csharp
+// Works — annotation propagates through the wrapper:
+void Wrapper([DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)] string s)
+    => CodeKeeper.Keep(s);
 ```
 
 ### `AlwaysFalse` / `AlwaysTrue`
@@ -50,15 +86,72 @@ Since these are evaluated at runtime, ILC must assume either branch is reachable
 
 | Mechanism | Generates native code? | Preserves members? |
 |---|---|---|
-| `Type.GetType("literal")` alone | Yes | **No** — trimmer strips constructors/members |
-| `Type.GetType("literal").GetConstructors()` | Yes | Constructors only |
-| `Type.GetType("literal").GetMembers(...)` | Yes | Yes — must cover all binding flag combos |
-| `[DynamicallyAccessedMembers(All)]` on generic `T` | Yes | Yes |
+| `[DynamicallyAccessedMembers(All)]` on generic `T` (annotation only, empty body) | Ref types via `__Canon`: yes. **Struct with value-type arg: NO** | Yes |
+| `[DynamicallyAccessedMembers(All)]` + `typeof(T).GetMembers(...)` in dead branch | Yes (all types) | Yes |
+| `[DynamicallyAccessedMembers(All)]` on `string` param (with literal at call site) | Yes | Yes — the trimmer parses the type name from the literal |
 | `[DynamicDependency(All, typeof(T))]` | Yes | Yes |
 | `[DynamicDependency(All, "TypeName", "Assembly")]` | **No** | Yes (metadata only) |
+| `Type.GetType("literal")` alone | Yes (code only) | **No** — trimmer strips constructors/members |
+| `Type.GetType("literal").GetConstructors()` | Yes | Constructors only |
+| `Type.GetType("literal").GetMembers(...)` | Yes | Yes — must cover all binding flag combos |
 | `Assembly.GetType("literal")` | **No** | **No** |
 | `Activator.CreateInstance(type)` in dead branch | No additional effect | **No** — trimmer can't trace runtime `Type` |
-| `[DynamicallyAccessedMembers]` on string param | No additional effect | **No** — annotation doesn't apply to strings |
+| Wrapping `Keep` without forwarding annotations | **No** | **No** — dataflow chain breaks (IL2091 warning) |
+
+### Annotation propagation across method boundaries
+
+The trimmer uses a **contract-based** system at method boundaries. When method `A<T>()` calls method `B<[DynamicallyAccessedMembers(All)] T>()`, the trimmer checks whether `A`'s `T` satisfies `B`'s requirement. If it doesn't, the trimmer emits IL2091 and **treats the call as contributing nothing** to `T`'s member preservation — regardless of what `B`'s body does.
+
+```csharp
+// Broken chain — WrappedKeep's T has no annotation, so Keep<T>() is treated as a no-op:
+static void WrappedKeep<T>()                        // T has no annotation
+    => CodeKeeper.Keep<T>();                         // Keep requires [DAM(All)] — IL2091 warning
+
+// Working chain — annotation forwarded:
+static void WrappedKeep<[DynamicallyAccessedMembers(All)] T>()
+    => CodeKeeper.Keep<T>();                         // T satisfies requirement — works
+```
+
+This applies equally to `string` and `Type` parameters. The same rules hold:
+- Each method boundary enforces annotation matching independently
+- A missing annotation at any link in the chain breaks propagation at that point
+- The trimmer does not look inside the called method to discover requirements — it only checks the declared annotations on the target's parameters
+
+DGML confirms this: when `WrappedKeep<T>()` lacks the annotation, its "Dataflow analysis" node has **zero outgoing edges** — the trimmer analyzed it but produced nothing. The `Keep<KitchenSink>()` call exists as compiled code but generates no `Reflectable type/method` entries.
+
+### Composing `Keep` for complex type patterns
+
+Since annotations propagate correctly across method boundaries (as long as every link carries `[DynamicallyAccessedMembers(All)]`), you can build higher-level retention helpers that compose `Keep<T>()` calls:
+
+```csharp
+// Keep T and all its common return type wrappers
+public static void KeepReturnType<[DynamicallyAccessedMembers(All)] T>()
+{
+    Keep<T>();
+    Keep<Result<T>>();
+    Keep<Task<T>>();
+    Keep<Task<Result<T>>>();
+    Keep<ValueTask<T>>();
+    Keep<ValueTask<Result<T>>>();
+}
+
+// Keep multiple types at once
+public static void KeepReturnTypes<
+    [DynamicallyAccessedMembers(All)] T1,
+    [DynamicallyAccessedMembers(All)] T2,
+    [DynamicallyAccessedMembers(All)] T3>()
+{
+    KeepReturnTypes<T1, T2>();
+    KeepReturnType<T3>();
+}
+```
+
+This works because:
+1. Each method in the chain has `[DynamicallyAccessedMembers(All)]` on its type parameters — the annotation chain is unbroken
+2. `Keep<T>()` uses `typeof(T).GetMembers(...)` in a dead branch — this forces code generation even for nested struct generics like `ValueTask<Result<StructA>>`
+3. The trimmer traces through the entire call graph: `KeepReturnTypes<StructA, StructB, StructC>()` → `KeepReturnType<StructA>()` → `Keep<Result<StructA>>()` → `typeof(Result<StructA>).GetMembers(...)`
+
+Tested with `KeepReturnTypes<StructA, StructB, StructC>()` — all 18 combinations (3 types x 6 wrappers) produce native code and preserve metadata, including deeply nested struct generics like `ValueTask<Result<StructC>>`.
 
 ### Generic sharing (Universal Shared Generics)
 
@@ -103,11 +196,21 @@ Key insight: direct interface usage in code (`((IRare<T>)impl).Value = ...`) pre
 
 | What's kept | `IRare<ClassA>` via reflection | `IRare<StructA>` via reflection |
 |---|---|---|
-| `Keep<IRare<object>>()` | **OK** — `__Canon` sharing | **OK** — also covered |
-| `Keep<IRare<ClassBase>>()` | **OK** — `__Canon` sharing | **OK** — also covered |
-| Nothing (just `new RareImpl<T>()`) | **NOT FOUND** | **NOT FOUND** |
+| `Keep<IRare<object>>()` + `new RareImpl<ClassA>()` + `new RareImpl<StructA>()` | **OK** | **OK** |
+| `Keep<IRare<ClassBase>>()` + `new RareImpl<ClassA>()` + `new RareImpl<StructA>()` | **OK** | **OK** |
+| Just `new RareImpl<ClassA>()` + `new RareImpl<StructA>()` (no Keep) | **NOT FOUND** | **NOT FOUND** |
 
-Keeping an interface with any reference type argument (e.g., `object`, `ClassBase`) preserves interface dispatch and reflection metadata for **all** type arguments — including value types. This is different from direct type retention where value types are never shared. Interface dispatch uses a different mechanism that covers all type args.
+This works for value types too, but **not** via `__Canon` sharing. DGML analysis reveals the actual mechanism:
+
+1. `Keep<IRare<object>>()` makes the `IRare<T>` interface **reflection-visible** (preserves `get_Value`/`set_Value` as reflectable methods on the open generic)
+2. `new RareImpl<StructA>()` in the test generates a **constructed type** for `RareImpl<StructA>`
+3. ILC sees that `RareImpl<StructA>` implements a reflection-visible interface (`IRare<T>`)
+4. This triggers: "Interface definition was visible" → `IRare<StructA>` gets metadata automatically
+5. The reflectable methods from step 1 become available on `IRare<StructA>`
+
+So it's the combination of **"interface is reflection-visible"** (from `Keep`) + **"implementor is constructed"** (from `new` or other code reference) that produces the metadata for closed generic interface types. Without `Keep`, the interface isn't reflection-visible, so step 4 never triggers even though the implementor exists.
+
+Important: the test must construct the implementor (e.g., `new RareImpl<StructA>()`) for this to work. `Keep<IRare<object>>()` alone does NOT generate `IRare<StructA>` — it only makes the interface reflection-visible. The closed generic is materialized when ILC encounters a constructed implementor.
 
 #### Cross-implementor sharing
 
@@ -159,7 +262,7 @@ NativeAOT tests are tricky because ILC performs whole-program analysis. Any type
 
 ### Isolation rules
 
-1. **Run one test at a time.** Edit `Program.cs` to call a single test method. Even commented-out code in other test methods is compiled into the assembly — if another test calls `Keep<RareClass<ClassA>>()`, ILC sees it and generates code, contaminating your test.
+1. **Run one test at a time.** Each test lives in its own file under `tests/`. The `.csproj` uses a `TestName` MSBuild property to include only one test file at compilation. Run via `Run.cmd <TestName>` or `dotnet publish -c Release -p:TestName=<TestName>`. This ensures no other test code is compiled into the assembly.
 
 2. **Never reference the type under test directly.** Use `ActivateGeneric(typeof(RareClass<>), typeof(ClassA))` instead of `new RareClass<ClassA>()`. The open generic `typeof(RareClass<>)` doesn't trigger codegen for any closed instantiation — only the `Keep(...)` call should do that.
 
@@ -186,6 +289,17 @@ NativeAOT tests are tricky because ILC performs whole-program analysis. Any type
    TestInterfaceMember(impl, typeof(IRare<object>), "Value");
    ```
 
+6. **Avoid `typeof()` for closed generic interfaces.** `typeof(IRare<StructA>)` emits a `ldtoken` that tells ILC about `IRare<StructA>` — contaminating interface sharing tests. Instead, construct closed generics via reflection:
+   ```csharp
+   // Bad — ldtoken introduces IRare<StructA> to ILC:
+   TestInterfaceMember(impl, typeof(IRare<StructA>), "Value");
+
+   // Good — open generic + MakeGenericType via M():
+   var iRareStructA = M(typeof(IRare<>)).MakeGenericType(M(typeof(StructA)));
+   TestInterfaceMember(impl, iRareStructA, "Value");
+   ```
+   DGML analysis confirmed this: `typeof(IRare<StructA>)` appears as a `ldtoken` edge from the test method, independently introducing the type to ILC regardless of any `Keep` call.
+
 ### Test helpers
 
 | Helper | Purpose |
@@ -201,21 +315,48 @@ NativeAOT tests are tricky because ILC performs whole-program analysis. Any type
 
 ## Dependency Graph Analysis
 
-`IlcGenerateDgmlFile` is enabled in the project. After publishing, ILC generates a `.dgml.xml` file in `obj/Release/net10.0/win-x64/native/` that contains the full dependency graph — every type, method, and reason it was included. Open it in Visual Studio or parse it to understand why a specific type or member was kept or trimmed.
+`IlcGenerateDgmlFile` is enabled in the project. After publishing, ILC generates two DGML files in `obj/Release/net10.0/win-x64/native/`:
+- `NativeAotQuirks.scan.dgml.xml` — the trimming/scanning dependency graph (what drives retention decisions)
+- `NativeAotQuirks.codegen.dgml.xml` — the code generation dependency graph
 
-Useful for debugging unexpected behavior, e.g., "why does this type have code but no ctor metadata?" — search for the type in the DGML to see what referenced it and through which dependency path.
+These are large XML files (100K+ lines). Use `grep` to trace dependencies:
+
+```bash
+# Find nodes for a type:
+grep "IRare.*StructA" *.scan.dgml.xml | grep "Node"
+
+# Find what points TO a node (why was it kept?):
+grep "Target=\"1401\"" *.scan.dgml.xml
+
+# Find what a node points TO (what does it cause to be kept?):
+grep "Source=\"671\"" *.scan.dgml.xml | grep "ldtoken"
+```
+
+Key node types to look for:
+- `ldtoken` — a `typeof()` reference in code; introduces a type to ILC
+- `newobj` — a `new` call; generates constructor code
+- `Reflectable type/method` — metadata preserved by `[DynamicallyAccessedMembers]`
+- `Dataflow analysis` — the trimmer's static analysis of annotation propagation
+- `Interface definition was visible` — interface metadata propagated to a constructed implementor
+- `__Canon` — shared generic code for reference type arguments
 
 ## Building and Running
 
 ```cmd
-PublishAndRun.cmd
+Run.cmd <TestName>
 ```
 
 Or manually:
 
 ```bash
-PATH="/c/Program Files (x86)/Microsoft Visual Studio/Installer:$PATH" dotnet publish -c Release
+PATH="/c/Program Files (x86)/Microsoft Visual Studio/Installer:$PATH" dotnet publish -c Release -p:TestName=<TestName>
 bin\Release\net10.0\win-x64\publish\NativeAotQuirks.exe
 ```
 
-Edit `Program.cs` to select which test to run — only one test should be active at a time to avoid cross-contamination of type retention between tests.
+Run without arguments to list available tests:
+
+```cmd
+Run.cmd
+```
+
+Each test is a separate file in `tests/` with a `partial class Tests` containing a single `Run()` method. Only one test is compiled at a time (selected via the `TestName` MSBuild property) to ensure complete isolation.

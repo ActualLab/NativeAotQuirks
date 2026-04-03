@@ -8,6 +8,7 @@ public class ClassA : ClassBase { public override string ToString() => "ClassA";
 public class ClassB : ClassBase { public override string ToString() => "ClassB"; }
 public struct StructA { public int X; public override string ToString() => $"StructA({X})"; }
 public struct StructB { public string? Y; public override string ToString() => $"StructB({Y})"; }
+public struct StructC { public double Z; public override string ToString() => $"StructC({Z})"; }
 
 // Interface + implementation generics for sharing tests
 public interface IRare<T> { T? Value { get; set; } }

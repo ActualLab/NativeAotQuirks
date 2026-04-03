@@ -16,7 +16,22 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="ActualLab.Core" Version="*" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Using Include="NativeAotQuirks" />
     <Using Include="NativeAotQuirks.Helpers" Static="True" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TestName Condition="'$(TestName)' == ''">NoTestName</TestName>
+  </PropertyGroup>
+
+  <!-- Exclude all tests, then include only the helpers and one specific test -->
+  <ItemGroup>
+    <Compile Remove="tests\**" />
+    <Compile Include="tests\_Helpers.cs" />
+    <Compile Include="tests\$(TestName).cs" />
   </ItemGroup>
 </Project>
