@@ -38,15 +38,33 @@ function Test-WindowsTerminal {
 }
 $hasWindowsTerminal = Test-WindowsTerminal
 
-# Chrome remote debugging port (standard)
-$ChromeDebugPort = 9222
+# Chrome remote debugging port (standard) and multi-instance defaults.
+# The `chrome` command supports `chrome[:PORT][*N]` (N=1..9). When `*N` is
+# given, each instance gets its own anonymous profile so cookies don't bleed
+# across them — useful for testing multi-user flows.
+$ChromeDebugPort           = 9222     # legacy single-port default (also exported to Docker for the chrome-devtools MCP)
+$ChromeDebugStartPort      = $ChromeDebugPort
+$ChromeInstanceCount       = 1
+$ChromeUseAnonymousProfile = $false
+$ChromeArgPattern          = '^chrome(?:[:*]\d+){0,2}$'
+$ChromeExtraArgs           = @()
+
+# Edge mirrors the Chrome shape but defaults to a different start port so the
+# two can run side by side without the firewall/port-collision dance.
+$EdgeDebugPort             = 9322
+$EdgeDebugStartPort        = $EdgeDebugPort
+$EdgeInstanceCount         = 1
+$EdgeUseAnonymousProfile   = $false
+$EdgeArgPattern            = '^edge(?:[:*]\d+){0,2}$'
+$EdgeExtraArgs             = @()
 
 # On Windows, if not already in Windows Terminal, relaunch in wt
 # WT_SESSION is set by Windows Terminal when running inside it
 # Exception: chrome command runs directly without terminal relaunch
 $currentOS = Get-CurrentOS
-$hasChrome = $args -contains "chrome"
-if ($currentOS -eq "Windows" -and $hasWindowsTerminal -and -not $env:WT_SESSION -and -not $hasChrome) {
+$hasChrome = ($args | Where-Object { $_ -match $ChromeArgPattern }).Count -gt 0
+$hasEdge   = ($args | Where-Object { $_ -match $EdgeArgPattern   }).Count -gt 0
+if ($currentOS -eq "Windows" -and $hasWindowsTerminal -and -not $env:WT_SESSION -and -not $hasChrome -and -not $hasEdge) {
     $scriptPath = $MyInvocation.MyCommand.Path
     $workDir = (Get-Location).Path
     # Keep terminal open for build, dry-run, debug, or help (only auto-close when actually running Claude)
@@ -179,10 +197,8 @@ $featureWorktreeSuffix = $null     # set when fwt/bwt argument is used
 $removeWorktreeSuffix  = $null     # set when rwt argument is used
 $wtType                = $null     # worktree type: "feature" or "bugfix"
 $newContainer          = $false
-$renewContainer        = $false
 $dryRun                = $false
 $debugMode             = $false
-$buildAgentFlag        = $null     # $null = auto (ActualChat only), $true = force on, $false = force off
 $claudeArgs            = @()
 
 # Show help
@@ -201,13 +217,11 @@ function Show-Help {
     Write-Host "  rwt <suffix> Remove worktree and clean up (ports, hosts, nginx config)"
     Write-Host "  chrome       Start Chrome with remote debugging enabled (for Playwright)"
     Write-Host "  build        Build Docker image for current project"
+    Write-Host "  update-md    Regenerate CLAUDE.md/AGENTS.md from .claude/CLAUDE-N-*.md parts"
     Write-Host "  help         Show this help message"
     Write-Host ""
     Write-Host "Options:"
     Write-Host "  --new        Force creation of a new Docker container (skip reuse)"
-    Write-Host "  --renew      Remove existing containers and start a new one (use after image rebuild)"
-    Write-Host "  --agent      Force start build agent (for server management from Docker)"
-    Write-Host "  --no-agent   Disable build agent (default for non-ActualChat projects)"
     Write-Host "  --dry-run    Show environment variables and command without executing"
     Write-Host "  --debug      Show debug output for troubleshooting"
     Write-Host ""
@@ -243,7 +257,15 @@ function Show-Help {
     Write-Host "  c rwt feature1     Remove feature1 worktree and clean up"
     Write-Host "  c os fwt feature1  Run on host OS in feature worktree"
     Write-Host "  c os bwt issue1    Run on host OS in bugfix worktree"
-    Write-Host "  c chrome           Start Chrome with remote debugging"
+    Write-Host "  c chrome           Start Chrome with remote debugging (default profile, port 9222)"
+    Write-Host "  c chrome:50000     Start Chrome on port 50000 (default profile)"
+    Write-Host "  c chrome*3         Start 3 Chrome instances on 9222..9224 (anonymous profiles)"
+    Write-Host "  c chrome*3:50000   Start 3 Chrome instances on 50000..50002 (anonymous profiles)"
+    Write-Host "  c chrome --mute-audio --window-size=1280,720"
+    Write-Host "                     Any args after chrome[*N][:PORT] are forwarded to the browser"
+    Write-Host "  c chrome --fake-media"
+    Write-Host "                     Use synthetic camera/mic streams (default is real devices)"
+    Write-Host "  c edge[:PORT][*N]  Same as chrome, for Microsoft Edge (default port 9322)"
     Write-Host "  c audio            Setup/start PulseAudio for voice mode (macOS only)"
     Write-Host "  c build            Build Docker image"
     Write-Host "  c --resume abc     Pass --resume abc to Claude"
@@ -259,9 +281,58 @@ while ($argIndex -lt $args.Count) {
     $currentArg = $args[$argIndex]
 
     # Check for mode commands
-    if ($currentArg -in "wsl", "os", "build", "chrome", "audio" -and $mode -eq "docker") {
+    if ($currentArg -in "wsl", "os", "build", "audio", "update-md" -and $mode -eq "docker") {
         $mode = $currentArg
         $argIndex++
+        continue
+    }
+
+    # Chrome command: `chrome`, `chrome:PORT`, `chrome*N`, `chrome:PORT*N`, `chrome*N:PORT`
+    # Any further args (e.g. `--mute-audio`, `--window-size=...`) are forwarded
+    # verbatim to the launched browser process.
+    if ($currentArg -match $ChromeArgPattern -and $mode -eq "docker") {
+        $mode = "chrome"
+        if ([regex]::Match($currentArg, ':(\d+)').Success) {
+            $ChromeDebugStartPort = [int][regex]::Match($currentArg, ':(\d+)').Groups[1].Value
+        }
+        if ([regex]::Match($currentArg, '\*(\d+)').Success) {
+            $n = [int][regex]::Match($currentArg, '\*(\d+)').Groups[1].Value
+            if ($n -lt 1 -or $n -gt 9) {
+                Write-Error "chrome: instance count must be between 1 and 9 (got $n)"
+                exit 1
+            }
+            $ChromeInstanceCount = $n
+            $ChromeUseAnonymousProfile = $true
+        }
+        $argIndex++
+        if ($argIndex -lt $args.Count) {
+            $ChromeExtraArgs = $args[$argIndex..($args.Count - 1)]
+            $argIndex = $args.Count
+        }
+        continue
+    }
+
+    # Edge command: same shape as chrome (`edge`, `edge:PORT`, `edge*N`, `edge:PORT*N`, `edge*N:PORT`).
+    # Any further args are forwarded to the browser process, same as chrome.
+    if ($currentArg -match $EdgeArgPattern -and $mode -eq "docker") {
+        $mode = "edge"
+        if ([regex]::Match($currentArg, ':(\d+)').Success) {
+            $EdgeDebugStartPort = [int][regex]::Match($currentArg, ':(\d+)').Groups[1].Value
+        }
+        if ([regex]::Match($currentArg, '\*(\d+)').Success) {
+            $n = [int][regex]::Match($currentArg, '\*(\d+)').Groups[1].Value
+            if ($n -lt 1 -or $n -gt 9) {
+                Write-Error "edge: instance count must be between 1 and 9 (got $n)"
+                exit 1
+            }
+            $EdgeInstanceCount = $n
+            $EdgeUseAnonymousProfile = $true
+        }
+        $argIndex++
+        if ($argIndex -lt $args.Count) {
+            $EdgeExtraArgs = $args[$argIndex..($args.Count - 1)]
+            $argIndex = $args.Count
+        }
         continue
     }
 
@@ -334,29 +405,9 @@ while ($argIndex -lt $args.Count) {
         continue
     }
 
-    # Check for --renew (remove existing containers and start fresh)
-    if ($currentArg -eq "--renew") {
-        $renewContainer = $true
-        $newContainer = $true  # --renew implies --new
-        $argIndex++
-        continue
-    }
-
     # Check for --debug
     if ($currentArg -eq "--debug") {
         $debugMode = $true
-        $argIndex++
-        continue
-    }
-
-    # Check for --agent / --no-agent
-    if ($currentArg -eq "--agent") {
-        $buildAgentFlag = $true
-        $argIndex++
-        continue
-    }
-    if ($currentArg -eq "--no-agent") {
-        $buildAgentFlag = $false
         $argIndex++
         continue
     }
@@ -368,6 +419,49 @@ while ($argIndex -lt $args.Count) {
 # All remaining args go to Claude
 if ($argIndex -lt $args.Count) {
     $claudeArgs = $args[$argIndex..($args.Count - 1)]
+}
+
+# Handle update-md: regenerate CLAUDE.md and AGENTS.md from .claude/CLAUDE-N-*.md parts.
+# Runs before project-root detection so it has no side effects (no port allocation, no .env writes).
+if ($mode -eq "update-md") {
+    $claudeDir = Join-Path $scriptDir ".claude"
+    if (-not (Test-Path $claudeDir)) {
+        Write-Error ".claude directory not found at: $claudeDir"
+        exit 1
+    }
+
+    $parts = Get-ChildItem -Path $claudeDir -Filter "CLAUDE-*.md" |
+        Where-Object { $_.Name -match '^CLAUDE-(\d+)-.+\.md$' } |
+        Sort-Object { [int]([regex]::Match($_.Name, '^CLAUDE-(\d+)-').Groups[1].Value) }
+
+    if (-not $parts -or $parts.Count -eq 0) {
+        Write-Error "No CLAUDE-N-*.md files found in $claudeDir"
+        exit 1
+    }
+
+    function Write-Concatenated {
+        param([string]$Path, [object[]]$Files)
+        $names = @($Files | ForEach-Object { $_.Name })
+        $sourceList = switch ($names.Count) {
+            1 { ".claude/$($names[0])" }
+            2 { ".claude/$($names[0]) and .claude/$($names[1])" }
+            default {
+                $prefixed = $names | ForEach-Object { ".claude/$_" }
+                $head = $prefixed[0..($prefixed.Count - 2)] -join ', '
+                "$head, and $($prefixed[-1])"
+            }
+        }
+        $header = "!!! This file is generated by concatenating $sourceList. If you have to update it, update the corresponding source file(s) as well."
+        $bodies = $Files | ForEach-Object { (Get-Content -Raw -Path $_.FullName).TrimEnd() }
+        $content = $header + "`n`n" + (($bodies -join "`n`n")) + "`n"
+        Set-Content -Path $Path -Value $content -NoNewline -Encoding utf8NoBOM
+        Write-Host "Wrote $Path ($($Files.Count) parts: $($names -join ', '))"
+    }
+
+    Write-Concatenated -Path (Join-Path $scriptDir "CLAUDE.md") -Files $parts
+    $agentsParts = $parts | Where-Object { $_.Name -notlike '*Launcher.md' }
+    Write-Concatenated -Path (Join-Path $scriptDir "AGENTS.md") -Files $agentsParts
+    exit 0
 }
 
 # Find current project
@@ -502,12 +596,12 @@ class WorktreeServer {
             -join $worktreeSuffix[0..([Math]::Min(19, $worktreeSuffix.Length - 1))]
         } else { "dev" }
 
-        # Build hostnames for this worktree (main project doesn't need custom hostnames)
+        # Build hostnames for this worktree (main project doesn't need custom hostnames).
         $this.Hostnames = if (-not $this.IsMainProject) {
             @(
                 "$($this.InstanceName).local.voxt.ai",
-                "cdn.$($this.InstanceName).local.voxt.ai",
-                "media.$($this.InstanceName).local.voxt.ai"
+                "cdn-$($this.InstanceName).local.voxt.ai",
+                "media-$($this.InstanceName).local.voxt.ai"
             )
         } else { @() }
 
@@ -523,16 +617,16 @@ class WorktreeServer {
     }
 
     [hashtable] Register([bool]$debug) {
-        # Return existing config if already registered
-        if ($this.Port) {
-            return $this.GetConfig()
+        if (-not $this.Port) {
+            $this.Port = $this.PortRegistry.Allocate($this.InstanceName)
+            if ($debug) {
+                Write-Host "[DEBUG] Allocated port $($this.Port) for instance '$($this.InstanceName)'"
+            }
         }
 
-        # Allocate new port
-        $this.Port = $this.PortRegistry.Allocate($this.InstanceName)
-        if ($debug) { Write-Host "[DEBUG] Allocated port $($this.Port) for instance '$($this.InstanceName)'" }
-
-        # Write nginx config and update hosts (only for worktrees, not main project)
+        # Re-apply nginx config and hosts entries on every launch so a changed LAN IP
+        # (e.g. after switching networks) gets propagated even when the port was already
+        # allocated. The helpers no-op when nothing has changed.
         if (-not $this.IsMainProject) {
             $this.WriteNginxConfig($debug)
             $this.ReloadNginx($debug)
@@ -587,17 +681,24 @@ class WorktreeServer {
     }
 
     hidden [void] ReloadNginx([bool]$debug) {
-        $originalLocation = Get-Location
-        Set-Location $this.ProjectPath
-        try {
-            $null = docker compose exec -T nginx nginx -s reload 2>&1
+        $nginxContainer = docker ps --filter "name=actual-chat-infra-nginx" --format "{{.Names}}" 2>$null | Select-Object -First 1
+        if (-not $nginxContainer) {
+            Write-Host "WARNING: nginx container not found — worktree routing may not work." -ForegroundColor Yellow
+            return
+        }
+
+        docker exec $nginxContainer nginx -s reload 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            if ($debug) { Write-Host "[DEBUG] Reloaded nginx" }
+        } else {
+            # Reload can fail due to stale bind mounts; restart refreshes them
+            if ($debug) { Write-Host "[DEBUG] nginx reload failed, restarting container" }
+            docker restart $nginxContainer 2>$null | Out-Null
             if ($LASTEXITCODE -eq 0) {
-                if ($debug) { Write-Host "[DEBUG] Reloaded nginx" }
+                if ($debug) { Write-Host "[DEBUG] Restarted nginx" }
             } else {
-                if ($debug) { Write-Host "[DEBUG] nginx reload failed (docker-compose may not be running)" }
+                Write-Host "WARNING: nginx restart failed — worktree routing may not work." -ForegroundColor Yellow
             }
-        } finally {
-            Set-Location $originalLocation
         }
     }
 
@@ -849,15 +950,9 @@ if ($removeWorktreeSuffix) {
 
     Write-Host "Removing worktree: $projectName-$removeWorktreeSuffix" -ForegroundColor Cyan
 
-    # Stop server, build agent, and Docker containers; then remove server config
+    # Stop server and Docker containers; then remove server config
     if (Test-Path (Join-Path $mainProjectPath "ActualChat.sln")) {
         $server = [WorktreeServer]::new($mainProjectPath, $removeWorktreeSuffix)
-
-        # Stop orphaned server and build agent from previous sessions
-        if ($server.Port -and (Test-Path $worktreePath)) {
-            [BuildAgent]::new($worktreePath).StopServer()
-            [BuildAgentHost]::new($worktreePath).Stop()
-        }
 
         # Kill Docker containers for this worktree
         $containerBaseName = "$($projectName.ToLower())-$($removeWorktreeSuffix.ToLower())"
@@ -1046,10 +1141,10 @@ if ($featureWorktreeSuffix) {
     Set-Location $worktreePath
 }
 
-# Register server config and write .env file (ActualChat projects only)
+# Register server config and write .env file (ActualChat projects only).
 $isActualChatProject = Test-Path (Join-Path $projectRoot "ActualChat.sln")
 $serverConfig = $null
-if ($isActualChatProject) {
+if ($isActualChatProject -and -not $fromMode) {
     $mainProjectPath = if ($worktree -or $worktreeSuffix -or $featureWorktreeSuffix) {
         Join-Path $env:AC_ProjectRoot $projectName
     } else {
@@ -1058,20 +1153,17 @@ if ($isActualChatProject) {
     $server = [WorktreeServer]::new($mainProjectPath, $worktree)
     $serverConfig = $server.Register($debugMode)
 
-    # Write server configuration to .env file in the project/worktree directory
-    # Uses .NET configuration names so they're automatically picked up by the server
-    $baseUri = if ($serverConfig.InstanceName -ne "dev") { "https://$($serverConfig.InstanceName).local.voxt.ai" } else { "https://local.voxt.ai" }
-    $urlsValue = "http://0.0.0.0:$($serverConfig.Port)"
-    $envVarsToSave = @{
-        "CoreSettings__Instance" = $serverConfig.InstanceName
-        # Use 0.0.0.0 to allow connections from nginx container
-        # "urls" is for .NET config loading, "ASPNETCORE_URLS" is for env var loading
-        "urls" = $urlsValue
-        "ASPNETCORE_URLS" = $urlsValue
-        "HostSettings__BaseUri" = $baseUri
-        "AC_BUILD_AGENT_PORT" = $serverConfig.Port + 9
+    # Write server configuration to .env file in the worktree directory.
+    # Uses .NET configuration names so they're automatically picked up by the server.
+    # Skipped for the main project (dev instance) so its .env stays untouched.
+    if ($serverConfig.InstanceName -ne "dev") {
+        $envVarsToSave = @{
+            "CoreSettings__Instance" = $serverConfig.InstanceName
+            "HostSettings__BasePort" = "$($serverConfig.Port)"
+            "HostSettings__BaseUri" = "https://$($serverConfig.InstanceName).local.voxt.ai"
+        }
+        Update-EnvFile -ProjectPath $projectRoot -Variables $envVarsToSave -Debug:$debugMode
     }
-    Update-EnvFile -ProjectPath $projectRoot -Variables $envVarsToSave -Debug:$debugMode
 }
 
 # Suppress output when launching docker (inner instance will output)
@@ -1153,19 +1245,194 @@ if ($env:AC_GITHUB_TOKEN -and -not $env:GH_TOKEN) {
     $env:GH_TOKEN = $env:AC_GITHUB_TOKEN
 }
 
+# Shared helpers used by the `chrome` and `edge` modes below.
+function Test-DebugPort {
+    param([int]$Port)
+    if ($currentOS -eq "Windows") {
+        return $null -ne (netstat -an | Select-String ":$Port\s+.*LISTENING")
+    }
+    bash -c "lsof -i :$Port -sTCP:LISTEN 2>/dev/null || nc -z localhost $Port 2>/dev/null" | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+function Ensure-FirewallRule {
+    param([int]$Port, [string]$BrowserName)
+    if ($currentOS -ne "Windows") { return }
+    $ruleName = "$BrowserName Remote Debugging (Claude) port $Port"
+    netsh advfirewall firewall show rule name="$ruleName" 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return }
+
+    Write-Host "Creating firewall rule for port $Port..." -ForegroundColor Cyan
+    $result = netsh advfirewall firewall add rule `
+        name="$ruleName" `
+        dir=in action=allow protocol=tcp `
+        localport=$Port profile=private `
+        description="Allow $BrowserName remote debugging connections from WSL/Docker" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        if ($result -match "requires elevation|Access is denied|administrator") {
+            Write-Host ""
+            Write-Host "Failed to create firewall rule - administrator privileges required." -ForegroundColor Yellow
+            Write-Host "Run this in an elevated PowerShell, or re-run as Administrator:" -ForegroundColor Yellow
+            Write-Host "  netsh advfirewall firewall add rule name=`"$ruleName`" dir=in action=allow protocol=tcp localport=$Port profile=private" -ForegroundColor White
+            exit 1
+        }
+        Write-Host "Warning: Failed to create firewall rule for port $Port`: $result" -ForegroundColor Yellow
+    }
+}
+
+# Launches one or more debug-enabled browser instances. Caller supplies the
+# OS-specific executable path, the default and anonymous profile-dir bases,
+# and the browser name (used for log/firewall messages).
+function Start-DebugBrowsers {
+    param(
+        [string]$BrowserName,
+        [string]$ExePath,
+        [string]$DefaultProfileDir,
+        [string]$AnonProfileBase,
+        [int]   $StartPort,
+        [int]   $Count,
+        [bool]  $UseAnonymous,
+        [string[]]$ExtraArgs = @()
+    )
+    Write-Host "$BrowserName path: $ExePath"
+    for ($i = 0; $i -lt $Count; $i++) {
+        $port = $StartPort + $i
+        $profileDir = if ($UseAnonymous) { "$AnonProfileBase-$port" } else { $DefaultProfileDir }
+
+        Ensure-FirewallRule -Port $port -BrowserName $BrowserName
+
+        if (Test-DebugPort -Port $port) {
+            Write-Host "$BrowserName already running on port $port — skipping" -ForegroundColor Yellow
+            continue
+        }
+
+        $label = if ($UseAnonymous) { "anonymous" } else { "default" }
+        Write-Host "Starting $BrowserName on port $port ($label profile: $profileDir)..." -ForegroundColor Cyan
+        # Pull out our own meta-flag (`--fake-media`) before anything is
+        # forwarded to the browser. If present, Chrome is launched with the
+        # synthetic media-stream backend (mjpeg/wav fake camera + mic);
+        # otherwise Chrome opens the real camera and microphone. Default is
+        # REAL devices so screencast/voice testing on actual hardware works
+        # without per-launch tweaking; the dev rig opts in by adding
+        # `--fake-media`.
+        $useFakeMedia = $false
+        $forwardedArgs = @()
+        foreach ($a in $ExtraArgs) {
+            if ($a -eq "--fake-media") {
+                $useFakeMedia = $true
+            } else {
+                $forwardedArgs += $a
+            }
+        }
+
+        # Permission / capture policy for the debug profile:
+        #   --disable-notifications              deny Notification API without prompting
+        #                                        (the "Allow notifications?" popup blocks the UI otherwise)
+        #   --use-fake-ui-for-media-stream       auto-accept mic/camera (no permission prompt) — kept
+        #                                        in both modes so the test profile never blocks on a
+        #                                        permission popup, regardless of fake vs real devices.
+        #   --use-fake-device-for-media-stream   (--fake-media only) feed synthetic streams instead of
+        #                                        real devices. Required for the --use-file-for-fake-*
+        #                                        flags to take effect — without it Chrome uses real cam/mic.
+        #   --use-file-for-fake-video-capture    (--fake-media only) feed mjpeg as the camera stream
+        #   --use-file-for-fake-audio-capture    (--fake-media only) feed wav as the mic stream
+        #   --auto-select-desktop-capture-source auto-pick a Voxt-titled window for getDisplayMedia
+        #                                        (skips the share-screen picker; matches Voxt's page
+        #                                        title — see <PageTitle>@CoreConstants.AppName).
+        #                                        Tab-only is a separate flag if window-mode picks a
+        #                                        sibling instance: --auto-select-tab-capture-source-by-title=Voxt
+        #   --test-type                          quiet "controlled by automated test software" infobar
+        $fakeVideo = Join-Path $ScriptDir "lib/data/test-video-1.mjpeg"
+        $fakeAudio = Join-Path $ScriptDir "lib/data/test-audio-1.wav"
+        # Pass the project URL as a positional arg so the browser opens it as
+        # its first tab — otherwise an anonymous profile shows the "Sign in
+        # to Chrome" / "Welcome to Edge" greeter and you have to navigate
+        # manually.
+        # Built-in flags first, caller's pass-through next, then the URL —
+        # later flags override earlier ones, so user-supplied args win.
+        # TEMP: dropped `--use-file-for-fake-video-capture=...mjpeg` — under
+        # Chromium 147 the fake-device pipeline silently stops producing
+        # frames after ~1 second of MJPEG content (verified: track stays
+        # `live` but `<video>.currentTime` never advances and rVFC
+        # never fires). Without the flag Chrome falls back to its
+        # built-in synthetic moving-color-bars fake, which is supposed
+        # to keep producing frames indefinitely.
+        # If this works, the next step is to convert the test mjpeg
+        # to Y4M and put the flag back with that file.
+        $cmdArgs = @(
+            "--remote-debugging-port=$port",
+            "--remote-debugging-address=0.0.0.0",
+            "--user-data-dir=`"$profileDir`"",
+            "--remote-allow-origins=*",
+            "--disable-notifications",
+            "--use-fake-ui-for-media-stream",
+            "--auto-select-desktop-capture-source=Voxt",
+            "--test-type"
+        )
+        if ($useFakeMedia) {
+            $cmdArgs += @(
+                "--use-fake-device-for-media-stream",
+                # "--use-file-for-fake-video-capture=`"$fakeVideo`"",
+                "--use-file-for-fake-audio-capture=`"$fakeAudio`""
+            )
+            Write-Host "  media: fake (synthetic camera, $fakeAudio mic)" -ForegroundColor DarkGray
+        } else {
+            Write-Host "  media: real devices (pass --fake-media for synthetic)" -ForegroundColor DarkGray
+        }
+        $cmdArgs = $cmdArgs + $forwardedArgs + @("https://local.voxt.ai/")
+        if ($forwardedArgs.Count -gt 0) {
+            Write-Host "  extra args: $($forwardedArgs -join ' ')" -ForegroundColor DarkGray
+        }
+        Start-Process -FilePath $ExePath -ArgumentList $cmdArgs
+
+        $maxWait = 30; $waited = 0; $printedWaiting = $false
+        while (-not (Test-DebugPort -Port $port) -and $waited -lt $maxWait) {
+            Start-Sleep -Seconds 1; $waited++
+            if ($waited -gt 2 -and -not $printedWaiting) {
+                Write-Host "  waiting for port $port`: " -NoNewline
+                $printedWaiting = $true
+            }
+            if ($printedWaiting) { Write-Host "." -NoNewline }
+        }
+        if ($printedWaiting) { Write-Host "" }
+
+        if (Test-DebugPort -Port $port) {
+            Write-Host "  ready on port $port" -ForegroundColor Green
+        } else {
+            Write-Host "  timed out waiting for port $port" -ForegroundColor Yellow
+        }
+    }
+}
+
 switch ($mode) {
     "build" {
         # Build Docker image
-        $containerName = "claude-$($projectName.ToLower())"
-        Write-Host "Building Docker image: $containerName"
+        $imageName = "claude-$($projectName.ToLower())"
+        Write-Host "Building Docker image: $imageName"
         if (-not $dryRun) {
-            docker build -t $containerName -f "$projectRoot/claude.Dockerfile" $projectRoot
+            # Capture containers based on the current image BEFORE rebuilding.
+            # After rebuild the tag points to a new image ID, and containers based
+            # on the old (now-dangling) image would no longer match an ancestor filter.
+            $staleContainers = @(docker ps -a --filter "ancestor=$imageName" --format "{{.ID}}`t{{.Names}}" 2>$null | Where-Object { $_ })
+
+            docker build -t $imageName -f "$projectRoot/claude.Dockerfile" $projectRoot
+            if ($LASTEXITCODE -eq 0 -and $staleContainers.Count -gt 0) {
+                Write-Host ""
+                Write-Host "Removing $($staleContainers.Count) container(s) based on the previous image:" -ForegroundColor Cyan
+                foreach ($entry in $staleContainers) {
+                    $parts = $entry -split "`t"
+                    $cId = $parts[0]
+                    $cName = $parts[1]
+                    Write-Host "  $cName" -ForegroundColor DarkGray
+                    docker rm -f $cId 2>$null | Out-Null
+                }
+            }
         } else {
             Write-Host ""
             Write-Host "=== DRY RUN ===" -ForegroundColor Yellow
             Write-Host ""
             Write-Host "Command:" -ForegroundColor Cyan
-            Write-Host "  docker build -t $containerName -f `"$projectRoot/claude.Dockerfile`" $projectRoot"
+            Write-Host "  docker build -t $imageName -f `"$projectRoot/claude.Dockerfile`" $projectRoot"
             Write-Host ""
         }
     }
@@ -1281,6 +1548,15 @@ switch ($mode) {
         } else {
             # Only skip permissions in Docker (sandboxed environment)
             if ($currentOS -eq "Docker") {
+                # Copy host SSH keys to ~/.ssh with strict perms (host bind-mount has loose
+                # Windows perms that OpenSSH rejects). Skip silently if no host mount.
+                if (Test-Path "/home/claude/.ssh-host") {
+                    $sshDir = "/home/claude/.ssh"
+                    New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+                    Copy-Item -Path "/home/claude/.ssh-host/*" -Destination $sshDir -Recurse -Force -ErrorAction SilentlyContinue
+                    & chmod 700 $sshDir
+                    & sh -c "chmod 600 $sshDir/* 2>/dev/null; chmod 644 $sshDir/*.pub $sshDir/known_hosts $sshDir/config 2>/dev/null; true"
+                }
                 & claude --dangerously-skip-permissions @claudeArgs
                 if ($debugMode) {
                     Write-Host ""
@@ -1363,6 +1639,14 @@ switch ($mode) {
             $volumeMounts += New-VolumeMount $gitConfigPath "/home/claude/.gitconfig" -ReadOnly
         }
 
+        # SSH keys mount (read-only; copied to ~/.ssh with strict perms inside container)
+        # Mounted to .ssh-host (not .ssh) because Windows bind-mounts expose loose perms
+        # that OpenSSH refuses. The "os" branch copies + chmods on container start.
+        $sshPath = "$homeDir/.ssh"
+        if (Test-Path $sshPath) {
+            $volumeMounts += New-VolumeMount $sshPath "/home/claude/.ssh-host" -ReadOnly
+        }
+
         # Gcloud config mount
         $gcloudConfigPath = if ($currentOS -eq "Windows") { "$env:APPDATA/gcloud" } else { "$homeDir/.config/gcloud" }
         if (Test-Path $gcloudConfigPath) {
@@ -1399,26 +1683,6 @@ switch ($mode) {
         if ($dryRun) { $dockerScriptArgs += "--dry-run" }
         if ($debugMode) { $dockerScriptArgs += "--debug" }
         $dockerScriptArgs += $claudeArgs
-
-        # --renew: remove existing containers for this worktree before creating a new one
-        if ($renewContainer) {
-            $existingToRemove = @(docker ps -a --filter "label=worktree=$containerBaseName" --format "{{.ID}}`t{{.Names}}" 2>$null | Where-Object { $_ })
-            if ($existingToRemove.Count -gt 0) {
-                foreach ($entry in $existingToRemove) {
-                    $parts = $entry -split "`t"
-                    $cId = $parts[0]
-                    $cName = $parts[1]
-                    if ($dryRun) {
-                        Write-Host "Would remove container: $cName ($cId)" -ForegroundColor Yellow
-                    } else {
-                        Write-Host "Removing container: $cName" -ForegroundColor Cyan
-                        docker rm -f $cId 2>$null | Out-Null
-                    }
-                }
-            } else {
-                Write-Host "No existing containers to remove." -ForegroundColor DarkGray
-            }
-        }
 
         # Container reuse logic (default unless --new is specified)
         if (-not $newContainer) {
@@ -1510,19 +1774,7 @@ switch ($mode) {
             "-e", "PULSE_SERVER=$pulseServer"
         )
 
-        # Build agent for server/build management: on macOS/Windows, --network host doesn't
-        # truly share ports, so the .NET server must run on the host. The build agent host
-        # provides an HTTP API that Claude in Docker calls to build/start/stop the server.
-        # Controlled by --agent/--no-agent flags; defaults to auto (ActualChat projects only).
-        $useBuildAgent = if ($buildAgentFlag -ne $null) { $buildAgentFlag } else { $isActualChatProject }
-        $buildAgent = $null
-        $buildAgentEnvVars = @()
-        if ($useBuildAgent -and $currentOS -in "macOS", "Windows") {
-            $buildAgent = [BuildAgentHost]::new($projectRoot)
-            $buildAgentEnvVars = @("-e", "AC_BUILD_AGENT_PORT=$($buildAgent.Port)")
-        }
-
-        $dockerArgs += $volumeMounts + $propagatedEnvVars + $audioEnvVars + $buildAgentEnvVars + @(
+        $dockerArgs += $volumeMounts + $propagatedEnvVars + $audioEnvVars + @(
             "-e", "ANTHROPIC_API_KEY=$env:ANTHROPIC_API_KEY"
             "-e", "DISABLE_AUTOUPDATER=1"
             "-e", "DOTNET_SYSTEM_NET_DISABLEIPV6=1"
@@ -1560,18 +1812,8 @@ switch ($mode) {
             Write-Host "  docker $($dockerArgs -join ' ')"
             Write-Host ""
         } else {
-            # Start build agent if enabled — runs build/server operations over HTTP
-            # so Claude in Docker can build/start/stop the server on the host
-            if ($buildAgent) {
-                $buildAgent.Start()
-            }
-
-            try {
-                # On Windows, we're already in wt (handled at script start)
-                & docker @dockerArgs
-            } finally {
-                if ($buildAgent) { $buildAgent.Stop() }
-            }
+            # On Windows, we're already in wt (handled at script start)
+            & docker @dockerArgs
         }
     }
 
@@ -1580,143 +1822,76 @@ switch ($mode) {
     }
 
     "chrome" {
-        # Start Chrome with remote debugging enabled
-
-        # On Windows, ensure firewall rule exists for remote debugging port
         if ($currentOS -eq "Windows") {
-            $firewallRuleName = "Chrome Remote Debugging (Claude)"
-
-            # Check if firewall rule exists
-            $ruleExists = $false
-            try {
-                $existingRule = netsh advfirewall firewall show rule name="$firewallRuleName" 2>$null
-                $ruleExists = $LASTEXITCODE -eq 0 -and $existingRule
-            } catch {
-                $ruleExists = $false
-            }
-
-            if (-not $ruleExists) {
-                Write-Host "Creating firewall rule for Chrome remote debugging (port $ChromeDebugPort)..." -ForegroundColor Cyan
-
-                # Try to add the firewall rule
-                $result = netsh advfirewall firewall add rule `
-                    name="$firewallRuleName" `
-                    dir=in `
-                    action=allow `
-                    protocol=tcp `
-                    localport=$ChromeDebugPort `
-                    profile=private `
-                    description="Allow Chrome remote debugging connections from WSL/Docker" 2>&1
-
-                if ($LASTEXITCODE -ne 0) {
-                    # Check if it's a permission error
-                    if ($result -match "requires elevation|Access is denied|administrator") {
-                        Write-Host ""
-                        Write-Host "Failed to create firewall rule - administrator privileges required." -ForegroundColor Yellow
-                        Write-Host "Please run this command in an elevated PowerShell:" -ForegroundColor Yellow
-                        Write-Host ""
-                        Write-Host "  netsh advfirewall firewall add rule name=`"$firewallRuleName`" dir=in action=allow protocol=tcp localport=$ChromeDebugPort profile=private" -ForegroundColor White
-                        Write-Host ""
-                        Write-Host "Or re-run 'c chrome' as Administrator." -ForegroundColor Yellow
-                        exit 1
-                    } else {
-                        Write-Host "Warning: Failed to create firewall rule: $result" -ForegroundColor Yellow
-                        Write-Host "Connections from WSL/Docker may not work." -ForegroundColor Yellow
-                    }
-                } else {
-                    Write-Host "Firewall rule created successfully." -ForegroundColor Green
-                }
-            }
-        }
-
-        # Helper to check if debug port is open
-        function Test-DebugPort {
-            if ($currentOS -eq "Windows") {
-                $listening = netstat -an | Select-String ":$ChromeDebugPort\s+.*LISTENING"
-                return $null -ne $listening
-            } else {
-                # Unix/macOS: use lsof or nc
-                $result = bash -c "lsof -i :$ChromeDebugPort -sTCP:LISTEN 2>/dev/null || nc -z localhost $ChromeDebugPort 2>/dev/null"
-                return $LASTEXITCODE -eq 0
-            }
-        }
-
-        # Check if Chrome is already running with debug port
-        if (Test-DebugPort) {
-            Write-Host "Chrome is already running with remote debugging on port $ChromeDebugPort" -ForegroundColor Yellow
-            exit 0
-        }
-
-        # Find Chrome executable and user data dir based on OS
-        if ($currentOS -eq "Windows") {
-            $chromePaths = @(
+            $exePaths = @(
                 "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
                 "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
                 "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
             )
-            $debugUserDataDir = "$env:LOCALAPPDATA\Google\Chrome\Playwright"
+            $defaultProfileDir = "$env:LOCALAPPDATA\Google\Chrome\Playwright"
+            $anonProfileBase   = "$env:LOCALAPPDATA\Google\Chrome\Playwright-anon"
         } elseif ($currentOS -eq "macOS") {
-            $chromePaths = @(
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            )
-            $debugUserDataDir = "$env:HOME/Library/Application Support/Google/Chrome Playwright"
+            $exePaths = @("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+            $defaultProfileDir = "$env:HOME/Library/Application Support/Google/Chrome Playwright"
+            $anonProfileBase   = "$env:HOME/Library/Application Support/Google/Chrome Playwright-anon"
         } else {
-            # Linux
-            $chromePaths = @(
-                "/usr/bin/google-chrome",
-                "/usr/bin/google-chrome-stable",
-                "/usr/bin/chromium-browser",
-                "/usr/bin/chromium"
+            $exePaths = @(
+                "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium-browser", "/usr/bin/chromium"
             )
-            $debugUserDataDir = "$env:HOME/.config/google-chrome-playwright"
+            $defaultProfileDir = "$env:HOME/.config/google-chrome-playwright"
+            $anonProfileBase   = "$env:HOME/.config/google-chrome-playwright-anon"
         }
-
-        $chromePath = $null
-        foreach ($path in $chromePaths) {
-            if (Test-Path $path) {
-                $chromePath = $path
-                break
-            }
-        }
-
-        if (-not $chromePath) {
+        $exePath = $exePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $exePath) {
             Write-Error "Chrome not found. Please install Google Chrome."
             exit 1
         }
+        Start-DebugBrowsers `
+            -BrowserName "Chrome" `
+            -ExePath $exePath `
+            -DefaultProfileDir $defaultProfileDir `
+            -AnonProfileBase $anonProfileBase `
+            -StartPort $ChromeDebugStartPort `
+            -Count $ChromeInstanceCount `
+            -UseAnonymous $ChromeUseAnonymousProfile `
+            -ExtraArgs $ChromeExtraArgs
+    }
 
-        Write-Host "Starting Chrome with remote debugging on port $ChromeDebugPort..." -ForegroundColor Cyan
-        Write-Host "Chrome path: $chromePath"
-
-        # Use a separate user data dir to force a new Chrome instance (otherwise Chrome reuses existing process and ignores debug flag)
-        # Start Chrome with remote debugging in a new process
-        # --remote-debugging-address=0.0.0.0 allows connections from WSL/Docker (not just localhost)
-        Start-Process -FilePath $chromePath -ArgumentList "--remote-debugging-port=$ChromeDebugPort", "--remote-debugging-address=0.0.0.0", "--user-data-dir=`"$debugUserDataDir`"", "--remote-allow-origins=*"
-
-        # Wait for debug port to open (check once per second, max 30 seconds)
-        # First 2 checks are silent, then show waiting message
-        $maxWait = 30
-        $waited = 0
-        $printedWaiting = $false
-        while (-not (Test-DebugPort) -and $waited -lt $maxWait) {
-            Start-Sleep -Seconds 1
-            $waited++
-            if ($waited -gt 2 -and -not $printedWaiting) {
-                Write-Host "Waiting for the debug port to open: " -NoNewline
-                $printedWaiting = $true
-            }
-            if ($printedWaiting) {
-                Write-Host "." -NoNewline
-            }
-        }
-        if ($printedWaiting) {
-            Write-Host ""
-        }
-
-        if (Test-DebugPort) {
-            Write-Host "Chrome started with remote debugging on port $ChromeDebugPort" -ForegroundColor Green
-            Write-Host "Note: This uses a separate profile (Playwright)" -ForegroundColor DarkGray
+    "edge" {
+        if ($currentOS -eq "Windows") {
+            $exePaths = @(
+                "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+                "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+                "$env:LOCALAPPDATA\Microsoft\Edge\Application\msedge.exe"
+            )
+            $defaultProfileDir = "$env:LOCALAPPDATA\Microsoft\Edge\Playwright"
+            $anonProfileBase   = "$env:LOCALAPPDATA\Microsoft\Edge\Playwright-anon"
+        } elseif ($currentOS -eq "macOS") {
+            $exePaths = @("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge")
+            $defaultProfileDir = "$env:HOME/Library/Application Support/Microsoft Edge Playwright"
+            $anonProfileBase   = "$env:HOME/Library/Application Support/Microsoft Edge Playwright-anon"
         } else {
-            Write-Host "Timed out waiting for Chrome debug port." -ForegroundColor Yellow
+            $exePaths = @(
+                "/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable",
+                "/usr/bin/microsoft-edge-beta", "/usr/bin/microsoft-edge-dev"
+            )
+            $defaultProfileDir = "$env:HOME/.config/microsoft-edge-playwright"
+            $anonProfileBase   = "$env:HOME/.config/microsoft-edge-playwright-anon"
         }
+        $exePath = $exePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $exePath) {
+            Write-Error "Microsoft Edge not found. Please install Microsoft Edge."
+            exit 1
+        }
+        Start-DebugBrowsers `
+            -BrowserName "Edge" `
+            -ExePath $exePath `
+            -DefaultProfileDir $defaultProfileDir `
+            -AnonProfileBase $anonProfileBase `
+            -StartPort $EdgeDebugStartPort `
+            -Count $EdgeInstanceCount `
+            -UseAnonymous $EdgeUseAnonymousProfile `
+            -ExtraArgs $EdgeExtraArgs
     }
 }

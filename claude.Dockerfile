@@ -2,11 +2,16 @@
 # Supports: ActualLab.Fusion, ActualLab.Fusion.Samples, ActualChat
 # Includes: .NET 10 SDK, .NET 9 SDK, Node.js 20, Claude Code CLI
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0.201
+FROM mcr.microsoft.com/dotnet/sdk:10.0.202
 
 # Timezone setup
 ARG TZ=Etc/UTC
 ENV TZ="$TZ"
+
+# Swap archive.ubuntu.com for a faster mirror (archive.ubuntu.com geo-routes to
+# slow nodes from some networks, capping apt throughput to ~30 KB/s).
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.edge.kernel.org/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://mirrors.edge.kernel.org/ubuntu|g' \
+    /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
 
 # Install Node.js 20
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
@@ -15,12 +20,16 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 # Install dev tools, CLI utilities, Python 3, image tools, audio support
 RUN apt-get update && apt-get install -y \
     git git-lfs procps sudo fzf zsh man-db unzip gnupg2 \
-    gh jq wget curl less ca-certificates \
+    gh jq wget curl less ca-certificates openssh-client \
     python3 python3-pip python3-venv \
     imagemagick \
     ripgrep fd-find vim nano \
     pulseaudio-utils libpulse0 alsa-utils libasound2-plugins sox \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Pre-seed github.com SSH host keys so `git push` over SSH doesn't prompt
+RUN mkdir -p /etc/ssh && \
+    ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> /etc/ssh/ssh_known_hosts 2>/dev/null
 
 # PowerShell is pre-installed in .NET SDK image (both amd64 and arm64)
 RUN pwsh -Version
@@ -106,12 +115,9 @@ ENV PATH=/home/claude/.local/bin:$PATH:/usr/local/share/npm-global/bin
 # Pre-download Playwright Chromium browser (~280MB, speeds up first use)
 RUN playwright install chromium
 
-# Install Chrome DevTools MCP server (for browser automation debugging)
-RUN npm install -g chrome-devtools-mcp
-
 # Install Claude Code CLI (native installer, auto-update disabled at runtime)
 ENV DISABLE_AUTOUPDATER=1
-RUN curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.90
+RUN curl -fsSL https://claude.ai/install.sh | bash -s -- 2.1.143
 
 # Default working directory (overridden by -w flag in docker run)
 WORKDIR /proj
